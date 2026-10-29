@@ -39,6 +39,9 @@ impl RectI32 {
     pub fn bottom(&self) -> i32 {
         self.y + self.h
     }
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
+    }
     pub fn intersects(&self, other: &RectI32) -> bool {
         self.x < other.right()
             && self.right() > other.x
@@ -137,9 +140,8 @@ pub fn compute_harmonious_palette(images: &[RgbImage]) -> ([u8; 3], [u8; 3]) {
     let avg_g = (total_g / count) as f32;
     let avg_b = (total_b / count) as f32;
 
-    // Desaturate and darken to create an unobtrusive ambient background
     let luminance = 0.299 * avg_r + 0.587 * avg_g + 0.114 * avg_b;
-    let target_lum = 38.0; // Dark tone
+    let target_lum = 36.0;
     let lum_factor = if luminance > 0.0 {
         (target_lum / luminance).min(1.2)
     } else {
@@ -186,7 +188,6 @@ pub fn create_styled_background(
         let dist = (dx * dx + dy * dy).sqrt() / max_dist;
         let t = dist.clamp(0.0, 1.0);
 
-        // Subtle organic fluctuation
         let wobble = (((x as f32) * 0.003).sin() * ((y as f32) * 0.003).cos()) * 0.05;
         let blend = (t + wobble).clamp(0.0, 1.0);
 
@@ -213,9 +214,9 @@ pub fn decorate_photo_card(src: &RgbImage, style: FrameStyle) -> RgbaImage {
     let sh = src.height();
 
     let (pad_top, pad_bot, pad_sides, border_color) = match style {
-        FrameStyle::Polaroid => (18u32, 58u32, 18u32, [248, 248, 250, 255]),
-        FrameStyle::WoodFrame => (14u32, 14u32, 14u32, [48, 38, 30, 255]),
-        FrameStyle::ThinWhite => (8u32, 8u32, 8u32, [240, 240, 242, 255]),
+        FrameStyle::Polaroid => (20u32, 64u32, 20u32, [248, 248, 250, 255]),
+        FrameStyle::WoodFrame => (16u32, 16u32, 16u32, [45, 35, 28, 255]),
+        FrameStyle::ThinWhite => (10u32, 10u32, 10u32, [242, 242, 245, 255]),
         FrameStyle::None => (0u32, 0u32, 0u32, [0, 0, 0, 0]),
     };
 
@@ -224,19 +225,17 @@ pub fn decorate_photo_card(src: &RgbImage, style: FrameStyle) -> RgbaImage {
 
     let mut card = RgbaImage::from_pixel(card_w, card_h, Rgba(border_color));
 
-    // Secondary inner decorative line for wood frame
     if let FrameStyle::WoodFrame = style {
         for y in 0..card_h {
             for x in 0..card_w {
                 let edge = x == 4 || x == card_w - 5 || y == 4 || y == card_h - 5;
                 if edge {
-                    card.put_pixel(x, y, Rgba([180, 150, 90, 255]));
+                    card.put_pixel(x, y, Rgba([185, 155, 95, 255]));
                 }
             }
         }
     }
 
-    // Overlay photo inside frame
     for y in 0..sh {
         for x in 0..sw {
             let p = src.get_pixel(x, y);
@@ -247,7 +246,7 @@ pub fn decorate_photo_card(src: &RgbImage, style: FrameStyle) -> RgbaImage {
     card
 }
 
-/// Bilinear rotation with alpha channel. Angles are kept gentle (-15 deg to +15 deg).
+/// Bilinear rotation with alpha channel. Angles are kept gentle (-14 deg to +14 deg).
 pub fn rotate_rgba(src: &RgbaImage, angle_rad: f32) -> RgbaImage {
     let sw = src.width() as f32;
     let sh = src.height() as f32;
@@ -309,9 +308,8 @@ pub fn blend_tilted_card_with_shadow(
     let kw = card.width() as i32;
     let kh = card.height() as i32;
 
-    // 1. Soft drop shadow (offset +16, +22)
-    let shadow_ox = 16i32;
-    let shadow_oy = 22i32;
+    let shadow_ox = 20i32;
+    let shadow_oy = 28i32;
     for y in 0..kh {
         for x in 0..kw {
             let alpha = card.get_pixel(x as u32, y as u32)[3];
@@ -320,7 +318,7 @@ pub fn blend_tilted_card_with_shadow(
                 let target_y = pos_y + y + shadow_oy;
                 if target_x >= 0 && target_x < cw && target_y >= 0 && target_y < ch {
                     let p = canvas.get_pixel_mut(target_x as u32, target_y as u32);
-                    let shadow_factor = (alpha as f32 / 255.0) * 0.45;
+                    let shadow_factor = (alpha as f32 / 255.0) * 0.50;
                     p[0] = (p[0] as f32 * (1.0 - shadow_factor)) as u8;
                     p[1] = (p[1] as f32 * (1.0 - shadow_factor)) as u8;
                     p[2] = (p[2] as f32 * (1.0 - shadow_factor)) as u8;
@@ -329,7 +327,6 @@ pub fn blend_tilted_card_with_shadow(
         }
     }
 
-    // 2. Blend card
     for y in 0..kh {
         for x in 0..kw {
             let src_p = card.get_pixel(x as u32, y as u32);
@@ -348,14 +345,15 @@ pub fn blend_tilted_card_with_shadow(
     }
 }
 
-/// Mode B: Natural scattered collage with random gentle tilts, frames, and harmonious background
+/// Mode B: Natural scattered collage where images dominate the screen (low background occupancy).
+/// Uses 10 to 14 large 2K-class photos placed in dual overlapping layers.
 pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
     if images.is_empty() {
         return Err("No images provided for collage".to_string());
     }
 
     let mut loaded = Vec::new();
-    for p in images.iter().take(8) {
+    for p in images {
         if let Ok(src) = load_rgb_image(p) {
             loaded.push(src);
         }
@@ -375,52 +373,88 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         FrameStyle::None,
     ];
 
-    // Anchor regions across the 4K canvas to avoid clustering everything in one corner
-    let anchors = [
-        (800i32, 600i32),
-        (1920i32, 650i32),
-        (3040i32, 600i32),
-        (1000i32, 1450i32),
-        (2050i32, 1400i32),
-        (2900i32, 1500i32),
-        (1450i32, 1050i32),
+    // Anchors for Layer 1 (spread across screen regions) + Layer 2 (overlays)
+    let anchors_layer1 = [
+        (650i32, 550i32),
+        (1920i32, 500i32),
+        (3150i32, 550i32),
+        (650i32, 1600i32),
+        (1920i32, 1650i32),
+        (3150i32, 1600i32),
+        (300i32, 1080i32),
+        (3500i32, 1080i32),
+    ];
+
+    let anchors_layer2 = [
+        (1250i32, 900i32),
+        (2550i32, 900i32),
+        (1350i32, 1350i32),
+        (2450i32, 1350i32),
+        (1920i32, 1080i32),
     ];
 
     let mut photo_indices: Vec<usize> = (0..loaded.len()).collect();
     photo_indices.shuffle(&mut rng);
 
-    for (i, &idx) in photo_indices.iter().take(anchors.len()).enumerate() {
-        let src = &loaded[idx];
-        // Scale down large images so they don't cover the entire screen (max 850px)
-        let scaled = fit_downscale_only(src, 820);
+    let mut img_counter = 0;
+
+    // Layer 1: Background spread (scaled to max 1250px)
+    for (anchor_x, anchor_y) in anchors_layer1 {
+        let src = &loaded[photo_indices[img_counter % photo_indices.len()]];
+        img_counter += 1;
+
+        let max_dim = rng.gen_range(1100..=1350);
+        let scaled = fit_downscale_only(src, max_dim);
 
         let style = *frame_styles.choose(&mut rng).unwrap();
         let card = decorate_photo_card(&scaled, style);
 
-        // Gentle tilt between -13 and +13 degrees (never upside down)
         let angle_deg = if rng.gen_bool(0.5) {
-            rng.gen_range(3.5..12.5)
+            rng.gen_range(4.0..13.0)
         } else {
-            rng.gen_range(-12.5..-3.5)
+            rng.gen_range(-13.0..-4.0)
         };
-        let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
-        let rotated = rotate_rgba(&card, angle_rad);
+        let rotated = rotate_rgba(&card, angle_deg * (std::f32::consts::PI / 180.0));
 
-        let (anchor_x, anchor_y) = anchors[i % anchors.len()];
-        let jitter_x = rng.gen_range(-100..100);
-        let jitter_y = rng.gen_range(-80..80);
+        let jx = rng.gen_range(-70..70);
+        let jy = rng.gen_range(-60..60);
+        let px = anchor_x + jx - (rotated.width() as i32 / 2);
+        let py = anchor_y + jy - (rotated.height() as i32 / 2);
 
-        let place_x = anchor_x + jitter_x - (rotated.width() as i32 / 2);
-        let place_y = anchor_y + jitter_y - (rotated.height() as i32 / 2);
+        blend_tilted_card_with_shadow(&mut canvas, &rotated, px, py);
+    }
 
-        blend_tilted_card_with_shadow(&mut canvas, &rotated, place_x, place_y);
+    // Layer 2: Foreground overlapping hero cards (scaled to max 1150px)
+    for (anchor_x, anchor_y) in anchors_layer2 {
+        let src = &loaded[photo_indices[img_counter % photo_indices.len()]];
+        img_counter += 1;
+
+        let max_dim = rng.gen_range(1050..=1250);
+        let scaled = fit_downscale_only(src, max_dim);
+
+        let style = *frame_styles.choose(&mut rng).unwrap();
+        let card = decorate_photo_card(&scaled, style);
+
+        let angle_deg = if rng.gen_bool(0.5) {
+            rng.gen_range(3.0..10.0)
+        } else {
+            rng.gen_range(-10.0..-3.0)
+        };
+        let rotated = rotate_rgba(&card, angle_deg * (std::f32::consts::PI / 180.0));
+
+        let jx = rng.gen_range(-80..80);
+        let jy = rng.gen_range(-70..70);
+        let px = anchor_x + jx - (rotated.width() as i32 / 2);
+        let py = anchor_y + jy - (rotated.height() as i32 / 2);
+
+        blend_tilted_card_with_shadow(&mut canvas, &rotated, px, py);
     }
 
     Ok(canvas)
 }
 
 /// Mode C: Center-Outward Dynamic Tiling without internal cropping.
-/// Images expand outwards; only the outer edge of the 4K canvas is allowed to clip.
+/// Thoroughly covers the 4K canvas (low background occupancy), clipping only at canvas edges.
 pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     if images.is_empty() {
         return Err("No images provided for tiling".to_string());
@@ -452,9 +486,9 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     let mut placed: Vec<PlacedImage> = Vec::new();
     let mut placed_rects: Vec<RectI32> = Vec::new();
 
-    // 1. Place first hero image centered at (canvas_cx, canvas_cy)
+    // 1. Place initial center hero image
     let first_src = &loaded[0];
-    let first_scaled = fit_downscale_only(first_src, 750);
+    let first_scaled = fit_downscale_only(first_src, 920);
     let fw = first_scaled.width() as i32;
     let fh = first_scaled.height() as i32;
     let first_rect = RectI32 {
@@ -472,7 +506,6 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     let mut img_idx = 1;
     let mut attempts = 0;
 
-    // Helper: test if candidate rect overlaps any already placed rects (including gap)
     let overlaps_any = |cand: &RectI32, list: &[RectI32]| -> bool {
         let expanded = RectI32 {
             x: cand.x - gap,
@@ -488,34 +521,42 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         false
     };
 
-    // Packing loop: expand outwards until the entire canvas bounds are covered
-    while attempts < 120 {
+    // Helper: checks whether canvas interior still has uncovered regions
+    let is_canvas_fully_covered = |list: &[RectI32]| -> bool {
+        let check_cols = 16i32;
+        let check_rows = 9i32;
+        let step_x = (CANVAS_WIDTH_4K as i32) / check_cols;
+        let step_y = (CANVAS_HEIGHT_4K as i32) / check_rows;
+
+        for c in 0..check_cols {
+            let px = c * step_x + step_x / 2;
+            for r in 0..check_rows {
+                let py = r * step_y + step_y / 2;
+                let covered = list.iter().any(|rect| rect.contains(px, py));
+                if !covered {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+
+    // Continue packing outwards until 4K screen interior is completely covered
+    while attempts < 45 {
         attempts += 1;
 
-        // Check if canvas coverage extends past all 4 screen edges
-        let min_x = placed_rects.iter().map(|r| r.x).min().unwrap_or(0);
-        let max_x = placed_rects.iter().map(|r| r.right()).max().unwrap_or(0);
-        let min_y = placed_rects.iter().map(|r| r.y).min().unwrap_or(0);
-        let max_y = placed_rects.iter().map(|r| r.bottom()).max().unwrap_or(0);
-
-        if min_x <= 0
-            && max_x >= CANVAS_WIDTH_4K as i32
-            && min_y <= 0
-            && max_y >= CANVAS_HEIGHT_4K as i32
-        {
+        if placed.len() >= 18 && is_canvas_fully_covered(&placed_rects) {
             break;
         }
 
         let src = &loaded[img_idx % loaded.len()];
         img_idx += 1;
 
-        // Scale between 480px and 780px to introduce natural size variety
-        let max_dim = rng.gen_range(480..=750);
+        let max_dim = rng.gen_range(680..=980);
         let scaled = fit_downscale_only(src, max_dim);
         let w = scaled.width() as i32;
         let h = scaled.height() as i32;
 
-        // Generate candidate anchor positions adjacent to already placed tiles
         let mut candidates = Vec::new();
         for r in &placed_rects {
             // Right of r
@@ -572,7 +613,7 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
             });
         }
 
-        // Sort candidates by distance from screen center so packing progresses outwards
+        // Sort candidates prioritizing distance to screen center
         candidates.sort_by_key(|c| {
             let cx = c.x + c.w / 2;
             let cy = c.y + c.h / 2;
@@ -581,7 +622,6 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
             (dx * dx + dy * dy) as u64
         });
 
-        // Find closest non-overlapping candidate
         if let Some(best) = candidates
             .into_iter()
             .find(|c| !overlaps_any(c, &placed_rects))
@@ -594,7 +634,7 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         }
     }
 
-    // Render placed images onto canvas, clipping only at the 4K canvas boundaries
+    // Render placed images onto canvas, clipping only at canvas outer boundaries
     let cw = CANVAS_WIDTH_4K as i32;
     let ch = CANVAS_HEIGHT_4K as i32;
 
@@ -604,7 +644,6 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         let rw = item.rect.w;
         let rh = item.rect.h;
 
-        // Bounding box intersection with 4K canvas
         let start_x = rx.max(0);
         let end_x = (rx + rw).min(cw);
         let start_y = ry.max(0);
@@ -696,12 +735,12 @@ pub fn execute_shuffle_and_compose(
     } else {
         let use_tiling = rng.gen_bool(0.5);
         if use_tiling {
-            let count = 12.min(images.len());
+            let count = 24.min(images.len());
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_tiling(&selected)?;
             (CompositionMode::Tiling, img, selected)
         } else {
-            let count = 7.min(images.len());
+            let count = 14.min(images.len());
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (CompositionMode::Collage, img, selected)
@@ -756,13 +795,13 @@ pub fn execute_mode_explicit(
             (img, vec![images[0].clone()])
         }
         CompositionMode::Collage => {
-            let count = images.len().clamp(5, 8);
+            let count = images.len().min(14);
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (img, selected)
         }
         CompositionMode::Tiling => {
-            let count = images.len().min(16);
+            let count = images.len().min(26);
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_tiling(&selected)?;
             (img, selected)
@@ -812,7 +851,7 @@ mod tests {
     #[test]
     fn test_rotate_rgba_dimensions() {
         let card = RgbaImage::from_pixel(200, 300, Rgba([255, 255, 255, 255]));
-        let rotated = rotate_rgba(&card, 0.15); // ~8.6 degrees
+        let rotated = rotate_rgba(&card, 0.15);
         assert!(rotated.width() >= 200);
         assert!(rotated.height() >= 300);
     }
