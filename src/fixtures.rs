@@ -24,9 +24,9 @@ pub enum PatternType {
 
 pub fn get_sample_specs() -> Vec<FixtureSpec> {
     vec![
-        // ==========================================
-        // 1. 3K+ Large Landscapes (for direct 4K background)
-        // ==========================================
+        // ========================================================
+        // 1. 3K+ Large Landscapes (for direct 4K background, 6 items)
+        // ========================================================
         FixtureSpec {
             name: "01_4k_mountain_sunset.jpg",
             width: 3840,
@@ -68,133 +68,18 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::RadialGradient,
         },
         FixtureSpec {
-            name: "06_4k_golden_desert.jpg",
-            width: 3840,
-            height: 2160,
-            primary_color: [245, 185, 60],
-            secondary_color: [120, 50, 15],
-            pattern: PatternType::LinearGradientV,
-        },
-        FixtureSpec {
-            name: "07_uw_cosmic_horizon.jpg",
+            name: "06_uw_cosmic_horizon.jpg",
             width: 3440,
             height: 1440,
             primary_color: [45, 70, 200],
             secondary_color: [15, 15, 35],
             pattern: PatternType::LinearGradientH,
         },
+        // ========================================================
+        // 2. Sub-4K Portrait Images (Majority! 18 items, long edge ~2K)
+        // ========================================================
         FixtureSpec {
-            name: "08_uw_emerald_valley.jpg",
-            width: 3440,
-            height: 1440,
-            primary_color: [25, 175, 110],
-            secondary_color: [8, 45, 28],
-            pattern: PatternType::FramedBox,
-        },
-        // ==========================================
-        // 2. ~2K Landscapes (long edge ~1920-2560px)
-        // ==========================================
-        FixtureSpec {
-            name: "09_qhd_mist_lavender.jpg",
-            width: 2560,
-            height: 1440,
-            primary_color: [180, 160, 235],
-            secondary_color: [45, 30, 85],
-            pattern: PatternType::RadialGradient,
-        },
-        FixtureSpec {
-            name: "10_qhd_autumn_maple.jpg",
-            width: 2560,
-            height: 1440,
-            primary_color: [225, 80, 25],
-            secondary_color: [95, 25, 15],
-            pattern: PatternType::LinearGradientV,
-        },
-        FixtureSpec {
-            name: "11_qhd_aurora_borealis.jpg",
-            width: 2560,
-            height: 1440,
-            primary_color: [30, 220, 160],
-            secondary_color: [10, 30, 60],
-            pattern: PatternType::Stripes,
-        },
-        FixtureSpec {
-            name: "12_fhd_tokyo_night.jpg",
-            width: 1920,
-            height: 1080,
-            primary_color: [120, 30, 200],
-            secondary_color: [20, 10, 45],
-            pattern: PatternType::RadialGradient,
-        },
-        FixtureSpec {
-            name: "13_fhd_warm_amber.jpg",
-            width: 1920,
-            height: 1080,
-            primary_color: [255, 170, 20],
-            secondary_color: [130, 40, 10],
-            pattern: PatternType::FramedBox,
-        },
-        FixtureSpec {
-            name: "14_fhd_sapphire_lake.jpg",
-            width: 1920,
-            height: 1080,
-            primary_color: [30, 110, 220],
-            secondary_color: [10, 35, 90],
-            pattern: PatternType::LinearGradientV,
-        },
-        FixtureSpec {
-            name: "15_fhd_cherry_blossom.jpg",
-            width: 1920,
-            height: 1080,
-            primary_color: [255, 185, 200],
-            secondary_color: [170, 45, 95],
-            pattern: PatternType::LinearGradientH,
-        },
-        FixtureSpec {
-            name: "16_fhd_nordic_fjord.jpg",
-            width: 1920,
-            height: 1080,
-            primary_color: [130, 180, 210],
-            secondary_color: [40, 60, 90],
-            pattern: PatternType::Checkerboard,
-        },
-        FixtureSpec {
-            name: "17_4x3_vintage_cafe.jpg",
-            width: 2048,
-            height: 1536,
-            primary_color: [190, 140, 95],
-            secondary_color: [75, 45, 25],
-            pattern: PatternType::FramedBox,
-        },
-        FixtureSpec {
-            name: "18_4x3_retro_arcade.jpg",
-            width: 2048,
-            height: 1536,
-            primary_color: [230, 40, 110],
-            secondary_color: [30, 15, 80],
-            pattern: PatternType::RadialGradient,
-        },
-        FixtureSpec {
-            name: "19_16x10_zen_garden.jpg",
-            width: 1920,
-            height: 1200,
-            primary_color: [160, 195, 145],
-            secondary_color: [50, 75, 45],
-            pattern: PatternType::LinearGradientV,
-        },
-        FixtureSpec {
-            name: "20_16x10_coral_reef.jpg",
-            width: 1920,
-            height: 1200,
-            primary_color: [250, 110, 85],
-            secondary_color: [30, 80, 120],
-            pattern: PatternType::Stripes,
-        },
-        // ==========================================
-        // 3. ~2K Portraits (long edge ~1920-2560px)
-        // ==========================================
-        FixtureSpec {
-            name: "21_portrait_sakura_tower.jpg",
+            name: "07_portrait_sakura_tower.jpg",
             width: 1080,
             height: 1920,
             primary_color: [255, 180, 195],
@@ -202,7 +87,7 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::LinearGradientV,
         },
         FixtureSpec {
-            name: "22_portrait_azure_skylight.jpg",
+            name: "08_portrait_azure_skylight.jpg",
             width: 1080,
             height: 1920,
             primary_color: [95, 195, 255],
@@ -210,7 +95,7 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::LinearGradientV,
         },
         FixtureSpec {
-            name: "23_portrait_mint_flora.jpg",
+            name: "09_portrait_mint_flora.jpg",
             width: 1440,
             height: 2560,
             primary_color: [145, 245, 175],
@@ -218,7 +103,7 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::FramedBox,
         },
         FixtureSpec {
-            name: "24_portrait_amethyst_temple.jpg",
+            name: "10_portrait_amethyst_temple.jpg",
             width: 1080,
             height: 1920,
             primary_color: [160, 85, 215],
@@ -226,7 +111,7 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::Stripes,
         },
         FixtureSpec {
-            name: "25_portrait_arctic_glacier.jpg",
+            name: "11_portrait_arctic_glacier.jpg",
             width: 1200,
             height: 1920,
             primary_color: [195, 235, 255],
@@ -234,7 +119,7 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::RadialGradient,
         },
         FixtureSpec {
-            name: "26_portrait_sunset_boulevard.jpg",
+            name: "12_portrait_sunset_boulevard.jpg",
             width: 1200,
             height: 1920,
             primary_color: [250, 130, 45],
@@ -242,7 +127,7 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::LinearGradientV,
         },
         FixtureSpec {
-            name: "27_portrait_citrus_glow.jpg",
+            name: "13_portrait_citrus_glow.jpg",
             width: 1440,
             height: 2560,
             primary_color: [255, 210, 30],
@@ -250,16 +135,131 @@ pub fn get_sample_specs() -> Vec<FixtureSpec> {
             pattern: PatternType::FramedBox,
         },
         FixtureSpec {
-            name: "28_portrait_midnight_cathedral.jpg",
+            name: "14_portrait_midnight_cathedral.jpg",
             width: 1536,
             height: 2048,
             primary_color: [85, 45, 160],
             secondary_color: [18, 8, 42],
             pattern: PatternType::RadialGradient,
         },
-        // ==========================================
-        // 4. ~2K Square (1800x1800)
-        // ==========================================
+        FixtureSpec {
+            name: "15_portrait_emerald_bamboo.jpg",
+            width: 1080,
+            height: 1920,
+            primary_color: [40, 180, 100],
+            secondary_color: [10, 60, 30],
+            pattern: PatternType::LinearGradientV,
+        },
+        FixtureSpec {
+            name: "16_portrait_golden_lantern.jpg",
+            width: 1080,
+            height: 1920,
+            primary_color: [255, 195, 50],
+            secondary_color: [140, 70, 10],
+            pattern: PatternType::Stripes,
+        },
+        FixtureSpec {
+            name: "17_portrait_lavender_dusk.jpg",
+            width: 1200,
+            height: 1920,
+            primary_color: [175, 150, 230],
+            secondary_color: [50, 30, 80],
+            pattern: PatternType::LinearGradientH,
+        },
+        FixtureSpec {
+            name: "18_portrait_autumn_gate.jpg",
+            width: 1200,
+            height: 1920,
+            primary_color: [220, 85, 30],
+            secondary_color: [95, 25, 10],
+            pattern: PatternType::FramedBox,
+        },
+        FixtureSpec {
+            name: "19_portrait_crystal_falls.jpg",
+            width: 1440,
+            height: 2560,
+            primary_color: [80, 210, 240],
+            secondary_color: [20, 70, 130],
+            pattern: PatternType::RadialGradient,
+        },
+        FixtureSpec {
+            name: "20_portrait_neon_rain.jpg",
+            width: 1440,
+            height: 2560,
+            primary_color: [230, 30, 130],
+            secondary_color: [20, 20, 70],
+            pattern: PatternType::LinearGradientV,
+        },
+        FixtureSpec {
+            name: "21_portrait_monochrome_alley.jpg",
+            width: 1080,
+            height: 1920,
+            primary_color: [220, 220, 225],
+            secondary_color: [40, 42, 50],
+            pattern: PatternType::Checkerboard,
+        },
+        FixtureSpec {
+            name: "22_portrait_coral_garden.jpg",
+            width: 1536,
+            height: 2048,
+            primary_color: [250, 115, 90],
+            secondary_color: [80, 25, 40],
+            pattern: PatternType::LinearGradientV,
+        },
+        FixtureSpec {
+            name: "23_portrait_celestial_moon.jpg",
+            width: 1536,
+            height: 2048,
+            primary_color: [240, 240, 180],
+            secondary_color: [15, 25, 60],
+            pattern: PatternType::RadialGradient,
+        },
+        FixtureSpec {
+            name: "24_portrait_scarlet_bridge.jpg",
+            width: 1536,
+            height: 2048,
+            primary_color: [215, 35, 45],
+            secondary_color: [60, 10, 15],
+            pattern: PatternType::FramedBox,
+        },
+        // ========================================================
+        // 3. Sub-4K Landscape Images (4 items)
+        // ========================================================
+        FixtureSpec {
+            name: "25_fhd_sapphire_lake.jpg",
+            width: 1920,
+            height: 1080,
+            primary_color: [30, 110, 220],
+            secondary_color: [10, 35, 90],
+            pattern: PatternType::LinearGradientV,
+        },
+        FixtureSpec {
+            name: "26_fhd_warm_amber.jpg",
+            width: 1920,
+            height: 1080,
+            primary_color: [255, 170, 20],
+            secondary_color: [130, 40, 10],
+            pattern: PatternType::FramedBox,
+        },
+        FixtureSpec {
+            name: "27_fhd_cherry_blossom.jpg",
+            width: 1920,
+            height: 1080,
+            primary_color: [255, 185, 200],
+            secondary_color: [170, 45, 95],
+            pattern: PatternType::LinearGradientH,
+        },
+        FixtureSpec {
+            name: "28_4x3_vintage_cafe.jpg",
+            width: 2048,
+            height: 1536,
+            primary_color: [190, 140, 95],
+            secondary_color: [75, 45, 25],
+            pattern: PatternType::FramedBox,
+        },
+        // ========================================================
+        // 4. Sub-4K Square Images (2 items)
+        // ========================================================
         FixtureSpec {
             name: "29_square_ruby_mandala.jpg",
             width: 1800,
@@ -372,14 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn test_specs_dimensions() {
+    fn test_portrait_majority() {
         let specs = get_sample_specs();
-        for spec in specs {
-            assert!(
-                spec.width >= 1080 && spec.height >= 1080,
-                "Fixture {} is too small",
-                spec.name
-            );
-        }
+        let portraits = specs.iter().filter(|s| s.height > s.width).count();
+        let sub4k = specs
+            .iter()
+            .filter(|s| {
+                !(s.width >= 3000 && (s.width as f64 / s.height as f64 - 1.77).abs() < 0.35)
+            })
+            .count();
+        assert!(
+            portraits > sub4k / 2,
+            "Portraits ({}) should be the majority among sub-4k images ({})",
+            portraits,
+            sub4k
+        );
     }
 }
