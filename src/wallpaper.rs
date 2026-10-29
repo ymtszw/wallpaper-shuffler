@@ -5,8 +5,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub fn set_wallpaper(path: &Path) -> Result<(), String> {
-    let path_str = path.to_str().ok_or("Invalid UTF-8 path")?;
-    let mut wide: Vec<u16> = path_str.encode_utf16().collect();
+    if !path.exists() {
+        return Err(format!("Wallpaper file does not exist: {}", path.display()));
+    }
+
+    let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let path_str = abs_path.to_str().ok_or("Invalid UTF-8 path")?;
+    // Strip Windows extended path prefix "\\?\" as SystemParametersInfoW expects a standard path
+    let clean_str = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
+
+    let mut wide: Vec<u16> = clean_str.encode_utf16().collect();
     wide.push(0);
 
     unsafe {
@@ -39,5 +47,17 @@ impl Drop for ComGuard {
         unsafe {
             CoUninitialize();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_wallpaper_nonexistent_file() {
+        let nonexistent = Path::new("nonexistent_wallpaper_file_xyz123.jpg");
+        let res = set_wallpaper(nonexistent);
+        assert!(res.is_err());
     }
 }
