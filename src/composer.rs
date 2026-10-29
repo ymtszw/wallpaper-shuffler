@@ -4,11 +4,60 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub const CANVAS_WIDTH_4K: u32 = 3840;
 pub const CANVAS_HEIGHT_4K: u32 = 2160;
 pub const MIN_SINGLE_LANDSCAPE_WIDTH: u32 = 1900;
+
+static BG_ROTATION_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub struct AmbientPreset {
+    pub name: &'static str,
+    pub c1: [u8; 3],
+    pub c2: [u8; 3],
+}
+
+pub const AMBIENT_PRESETS: [AmbientPreset; 5] = [
+    // 1. 淡い紫 (Soft Lavender / Wisteria)
+    AmbientPreset {
+        name: "Soft Lavender (淡い紫)",
+        c1: [210, 200, 226], // Light lavender mist
+        c2: [170, 155, 195], // Muted twilight violet
+    },
+    // 2. 淡いピンク (Pastel Rose / Sakura Blossom)
+    AmbientPreset {
+        name: "Pastel Blossom (淡いピンク)",
+        c1: [232, 202, 212], // Soft sakura pink
+        c2: [198, 162, 178], // Muted rose
+    },
+    // 3. 淡いオレンジ (Warm Peach / Sunset Apricot)
+    AmbientPreset {
+        name: "Sunset Apricot (淡いオレンジ)",
+        c1: [238, 210, 190], // Warm peach
+        c2: [205, 172, 146], // Soft terracotta sand
+    },
+    // 4. 淡い青 (Soft Sky / Azure Mist)
+    AmbientPreset {
+        name: "Sky Mist (淡い青)",
+        c1: [192, 212, 235], // Soft baby sky tint
+        c2: [155, 180, 212], // Calm slate azure
+    },
+    // 5. 淡い緑 (Sage / Mint Tea)
+    AmbientPreset {
+        name: "Sage Mint (淡い緑)",
+        c1: [195, 218, 202], // Soft herbal mint
+        c2: [158, 192, 168], // Calming sage green
+    },
+];
+
+/// Get the next rotated ambient pastel gradient (Lavender -> Pink -> Orange -> Sky Blue -> Mint)
+pub fn next_rotated_ambient_gradient() -> AmbientPreset {
+    let idx = BG_ROTATION_INDEX.fetch_add(1, Ordering::Relaxed) % AMBIENT_PRESETS.len();
+    AMBIENT_PRESETS[idx]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositionMode {
@@ -485,8 +534,14 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         return Err("Failed to load any valid images for collage".to_string());
     }
 
-    let (c1, c2) = compute_complementary_gradient(&loaded);
-    let mut canvas = create_styled_background(CANVAS_WIDTH_4K, CANVAS_HEIGHT_4K, c1, c2, &mut rng);
+    let preset = next_rotated_ambient_gradient();
+    let mut canvas = create_styled_background(
+        CANVAS_WIDTH_4K,
+        CANVAS_HEIGHT_4K,
+        preset.c1,
+        preset.c2,
+        &mut rng,
+    );
 
     let frame_styles = [
         FrameStyle::Polaroid,
@@ -620,8 +675,14 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         return Err("Failed to load any valid images for tiling".to_string());
     }
 
-    let (c1, c2) = compute_complementary_gradient(&loaded);
-    let mut canvas = create_styled_background(CANVAS_WIDTH_4K, CANVAS_HEIGHT_4K, c1, c2, &mut rng);
+    let preset = next_rotated_ambient_gradient();
+    let mut canvas = create_styled_background(
+        CANVAS_WIDTH_4K,
+        CANVAS_HEIGHT_4K,
+        preset.c1,
+        preset.c2,
+        &mut rng,
+    );
 
     let canvas_cx = (CANVAS_WIDTH_4K / 2) as i32;
     let canvas_cy = (CANVAS_HEIGHT_4K / 2) as i32;
@@ -853,7 +914,7 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
 
 pub fn collect_image_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let valid_exts = ["jpg", "jpeg", "png", "webp"];
+    let valid_exts = ["jpg", "jpeg", "jfif", "jiff", "png", "webp"];
 
     for dir in dirs {
         if dir.is_file() {
@@ -985,13 +1046,16 @@ pub fn execute_mode_explicit(
             .map_err(|e| format!("Failed to create dir {}: {}", parent.display(), e))?;
     }
 
+    let mut rng = rand::thread_rng();
+    let mut pool = images.to_vec();
+    pool.shuffle(&mut rng);
+
     let (composed, used) = match mode {
         CompositionMode::Single => {
-            let single_img = if images.len() == 1 {
-                &images[0]
+            let single_img = if pool.len() == 1 {
+                &pool[0]
             } else {
-                images
-                    .iter()
+                pool.iter()
                     .find(|p| is_single_candidate(p))
                     .ok_or_else(|| {
                         format!(
@@ -1004,14 +1068,14 @@ pub fn execute_mode_explicit(
             (img, vec![single_img.clone()])
         }
         CompositionMode::Collage => {
-            let count = images.len().min(7);
-            let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
+            let count = pool.len().min(7);
+            let selected: Vec<PathBuf> = pool.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (img, selected)
         }
         CompositionMode::Tiling => {
-            let count = images.len().min(12);
-            let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
+            let count = pool.len().min(12);
+            let selected: Vec<PathBuf> = pool.iter().take(count).cloned().collect();
             let img = compose_tiling(&selected)?;
             (img, selected)
         }
@@ -1100,5 +1164,47 @@ mod tests {
         // Clean up
         let _ = fs::remove_file(&portrait_path);
         let _ = fs::remove_file(&landscape_2k_path);
+    }
+
+    #[test]
+    fn test_ambient_presets_rotation() {
+        let p0 = next_rotated_ambient_gradient();
+        let p1 = next_rotated_ambient_gradient();
+        let _p2 = next_rotated_ambient_gradient();
+        let _p3 = next_rotated_ambient_gradient();
+        let _p4 = next_rotated_ambient_gradient();
+        let p5 = next_rotated_ambient_gradient();
+
+        // Must rotate through presets
+        assert_ne!(p0.name, p1.name);
+        assert_eq!(p0.name, p5.name); // Full 5-step cycle
+    }
+
+    #[test]
+    fn test_extension_support_jfif_and_jiff() {
+        let temp_dir = std::env::temp_dir().join("wallpaper_shuffler_ext_test");
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let test_img = RgbImage::from_pixel(100, 100, Rgb([200, 100, 50]));
+        let jfif_file = temp_dir.join("sample.jfif");
+        let jiff_file = temp_dir.join("sample.jiff");
+        let webp_file = temp_dir.join("sample.webp");
+
+        test_img.save(&jfif_file).unwrap();
+        // Copy standard JPEG bytes to .jiff to simulate user files with .jiff extension
+        fs::copy(&jfif_file, &jiff_file).unwrap();
+        test_img.save(&webp_file).unwrap();
+
+        let collected = collect_image_files(std::slice::from_ref(&temp_dir));
+        assert_eq!(collected.len(), 3);
+
+        // Verify that load_rgb_image successfully decodes both jfif and jiff files
+        assert!(load_rgb_image(&jfif_file).is_ok());
+        assert!(load_rgb_image(&jiff_file).is_ok());
+
+        let _ = fs::remove_file(&jfif_file);
+        let _ = fs::remove_file(&jiff_file);
+        let _ = fs::remove_file(&webp_file);
+        let _ = fs::remove_dir(&temp_dir);
     }
 }

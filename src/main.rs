@@ -451,25 +451,19 @@ fn handle_test_compose(args: &[String]) {
 
     // 1. Single Mode Test
     println!("[1/3] Testing Single Image Fit Mode (4K 3840x2160)...");
-    if let Some(single_cand) = images.iter().find(|p| composer::is_single_candidate(p)) {
-        let out_single = out_dir.join("01_sample_single.jpg");
-        match composer::execute_mode_explicit(
-            composer::CompositionMode::Single,
-            std::slice::from_ref(single_cand),
-            &out_single,
-        ) {
-            Ok(res) => println!(
-                "  -> Generated {} in {}ms",
-                res.output_path.display(),
-                res.duration_ms
-            ),
-            Err(e) => eprintln!("  -> Failed: {}", e),
-        }
-    } else {
-        println!(
-            "  -> Skipped: No images qualify for Single mode (requires landscape width > height and width >= {}px).",
-            composer::MIN_SINGLE_LANDSCAPE_WIDTH
-        );
+    let out_single = out_dir.join("01_sample_single.jpg");
+    match composer::execute_mode_explicit(composer::CompositionMode::Single, &images, &out_single) {
+        Ok(res) => println!(
+            "  -> Generated {} in {}ms (used {})",
+            res.output_path.display(),
+            res.duration_ms,
+            res.source_images
+                .first()
+                .and_then(|p| p.file_name())
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+        Err(e) => println!("  -> Skipped: {}", e),
     }
 
     // 2. Collage Mode Test
