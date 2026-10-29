@@ -20,8 +20,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, MSG,
-    PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WM_COMMAND, WM_DESTROY, WM_TIMER,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WM_COMMAND, WM_CONTEXTMENU,
+    WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::w;
 
@@ -88,7 +88,10 @@ unsafe extern "system" fn window_proc(
             }
         }
         tray::WM_TRAYICON => {
-            // Context menu handling will be dispatched here
+            let event = (lparam.0 as usize & 0xFFFF) as u32;
+            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+                tray::show_tray_context_menu(hwnd);
+            }
         }
         WM_COMMAND => match wparam.0 {
             tray::IDM_SHUFFLE_NOW => {
