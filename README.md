@@ -10,10 +10,12 @@ Designed for 4K displays and heavy multi-window multitasking where wallpapers ar
 
 - **Desktop Exposure Trigger**: Automatically detects when your desktop transitions from hidden (<10% exposed) to visible (>=20% exposed), such as upon minimizing windows or pressing <kbd>Win</kbd> + <kbd>D</kbd>.
 - **Event-Driven & 0% CPU Idle**: Listens to native OS window movement and minimize events via Win32 `SetWinEventHook`. No continuous polling, zero background CPU drain.
-- **Smart Image Fitting & 4K Collage**:
-  - High-res wallpaper (matching aspect ratio and width >= 3000px): Applied directly as a single pristine image.
-  - Portrait or smaller images: Dynamically arranged into an aesthetic collage or dynamic tiles on a 4K canvas.
-  - History cache: Keeps recent generated collage wallpapers in a local history ring buffer.
+- **Smart Composition Engine (v1 Frozen)**:
+  - **Single 2K+ Fit**: Strictly landscape images ($\ge 1900\text{px}$) are center-fit to 4K (3840x2160) preserving aspect ratio. Portrait photos are never trimmed or forced.
+  - **Large-Print Collage**: 4 to 7 large prints (long edge 1450-1800px) scattered across 4K with gentle organic tilts ($\pm 3^\circ \sim \pm 9^\circ$), perimeter bleed, and guaranteed $\ge 70\%$ unoccluded visibility per photo.
+  - **Dynamic Irregular Tiling**: Unbiased center-outward packing with bold 30px gaps and spatial tracking to prevent uneven vacant pockets.
+  - **5-Color Rotating Pastel Ambient Backdrops**: Cycles through elegant soft tints (Lavender, Sakura Blossom, Sunset Apricot, Sky Mist, Sage Mint) with subtle spatial gradients behind photos.
+  - **Broad Format Support**: Seamlessly reads `.jpg`, `.jpeg`, `.jfif`, `.jiff`, `.png`, and `.webp`.
 - **Anti-Churn Debounce & Cooldown**: Waits for window rearranging to settle before calculating coverage, and enforces a cooldown period to avoid repetitive shuffling.
 - **System Tray & Windows Startup**: Discreet tray icon with quick controls (Shuffle Now, Pause, Config, Exit) and optional Windows startup integration.
 - **Minimal Footprint**: Native Rust binary with 3–8 MB memory usage and single `.exe` deployment.
@@ -42,6 +44,28 @@ To remove from startup:
 
 ```powershell
 wallpaper-shuffler.exe --unregister-startup
+```
+
+---
+
+## Testing & Image Generation Commands
+
+You can test composition algorithms or generate wallpapers on any directory without changing your Windows wallpaper:
+
+```powershell
+# Generate all 3 sample styles (Single, Collage, Tiling) with random sampling
+wallpaper-shuffler.exe --test-compose <IMAGE_DIR> [OUT_DIR]
+
+# Generate a specific style directly
+wallpaper-shuffler.exe --compose-collage <IMAGE_DIR> [OUT_FILE]
+wallpaper-shuffler.exe --compose-tiling  <IMAGE_DIR> [OUT_FILE]
+wallpaper-shuffler.exe --compose-single  <IMAGE_DIR_OR_FILE> [OUT_FILE]
+
+# Measure composition speeds across all 3 modes
+wallpaper-shuffler.exe --benchmark <IMAGE_DIR>
+
+# Run resident daemon in foreground console with real-time exposure & trigger logs
+wallpaper-shuffler.exe --run-foreground
 ```
 
 ---
