@@ -30,6 +30,10 @@ impl ScreenRect {
         let h = self.height().max(0) as i64;
         w * h
     }
+
+    pub fn contains_point(&self, x: i32, y: i32) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
 }
 
 pub fn get_virtual_screen_bounds() -> ScreenRect {
@@ -86,13 +90,7 @@ pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
     }
 }
 
-pub fn calculate_desktop_exposure_rate() -> f64 {
-    let screen = get_virtual_screen_bounds();
-    let total_area = screen.area();
-    if total_area == 0 {
-        return 100.0;
-    }
-
+pub fn collect_visible_window_rects() -> Vec<ScreenRect> {
     struct EnumState {
         windows: Vec<ScreenRect>,
     }
@@ -124,7 +122,50 @@ pub fn calculate_desktop_exposure_rate() -> f64 {
         );
     }
 
-    100.0
+    state.windows
+}
+
+/// Computes desktop exposure percentage (0.0% to 100.0%) via fast grid sampling
+pub fn calculate_desktop_exposure_rate() -> f64 {
+    let screen = get_virtual_screen_bounds();
+    let sw = screen.width();
+    let sh = screen.height();
+    if sw <= 0 || sh <= 0 {
+        return 100.0;
+    }
+
+    let window_rects = collect_visible_window_rects();
+    if window_rects.is_empty() {
+        return 100.0;
+    }
+
+    // Grid sampling: 48 x 27 grid = 1,296 sample points across 16:9 screen
+    let grid_x = 48i32;
+    let grid_y = 27i32;
+    let total_samples = grid_x * grid_y;
+    let mut exposed_samples = 0i32;
+
+    let step_x = sw / grid_x;
+    let step_y = sh / grid_y;
+
+    for gx in 0..grid_x {
+        let px = screen.left + gx * step_x + step_x / 2;
+        for gy in 0..grid_y {
+            let py = screen.top + gy * step_y + step_y / 2;
+            let mut covered = false;
+            for wr in &window_rects {
+                if wr.contains_point(px, py) {
+                    covered = true;
+                    break;
+                }
+            }
+            if !covered {
+                exposed_samples += 1;
+            }
+        }
+    }
+
+    (exposed_samples as f64 / total_samples as f64) * 100.0
 }
 
 pub fn has_cooldown_elapsed(last_shuffle: Option<DateTime<Utc>>, cooldown_seconds: u64) -> bool {
@@ -152,5 +193,16 @@ mod tests {
         assert_eq!(r.width(), 3840);
         assert_eq!(r.height(), 2160);
         assert_eq!(r.area(), 3840 * 2160);
+        assert!(r.contains_point(100, 100));
+        assert!(!r.contains_point(4000, 100));
+    }
+
+    #[test]
+    fn test_cooldown_logic() {
+        assert!(has_cooldown_elapsed(None, 300));
+        let past = Utc::now() - chrono::Duration::seconds(400);
+        assert!(has_cooldown_elapsed(Some(past), 300));
+        let recent = Utc::now() - chrono::Duration::seconds(10);
+        assert!(!has_cooldown_elapsed(Some(recent), 300));
     }
 }
