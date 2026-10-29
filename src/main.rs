@@ -259,7 +259,6 @@ fn run_daemon(foreground: bool) {
         let _tray = tray::TrayManager::new(hwnd);
         let _hook_guard = hook::install_window_event_hook(win_event_hook_proc);
 
-        // Record initial exposure
         let initial_exposure = detector::calculate_desktop_exposure_rate();
         *PREVIOUS_EXPOSURE.lock().unwrap() = Some(initial_exposure);
         if foreground {
@@ -281,24 +280,33 @@ fn print_help() {
     attach_parent_console();
     println!("wallpaper-shuffler v{}", env!("CARGO_PKG_VERSION"));
     println!("Lightweight event-driven Windows wallpaper shuffler\n");
-    println!("Usage: wallpaper-shuffler [OPTIONS]\n");
-    println!("Options:");
+    println!("Usage: wallpaper-shuffler [COMMAND/OPTION] [ARGS...]\n");
+    println!("Image Generation & Testing Commands:");
     println!(
-        "  --generate-fixtures [DIR]    Generate 30 synthetic test images (default: tests/fixtures/images)"
+        "  --shuffle-dry-run <DIR> [OUT_DIR]   Test full auto-shuffle pipeline on DIR (no wallpaper change)"
+    );
+    println!("  --compose-collage <DIR> [OUT_FILE]  Generate a 4K Collage from DIR to OUT_FILE");
+    println!("  --compose-tiling  <DIR> [OUT_FILE]  Generate a 4K Tiling from DIR to OUT_FILE");
+    println!("  --compose-single  <DIR> [OUT_FILE]  Generate a 4K Single Fit from DIR to OUT_FILE");
+    println!(
+        "  --test-compose    <DIR> [OUT_DIR]   Generate all 3 sample styles (Single, Collage, Tiling)"
     );
     println!(
-        "  --test-compose [IN] [OUT]    Generate Single, Collage, and Tiling samples from IN to OUT"
-    );
-    println!("  --benchmark [DIR]            Run performance benchmark on image composition modes");
-    println!(
-        "  --run-foreground             Run daemon in console with real-time event & trigger logging"
+        "  --benchmark       <DIR>             Benchmark performance on DIR across all styles"
     );
     println!(
-        "  --register-startup           Register application to start automatically on Windows boot"
+        "  --generate-fixtures [DIR]           Generate 30 synthetic 2K-4K test images (default: tests/fixtures/images)\n"
     );
-    println!("  --unregister-startup         Remove application from Windows startup");
-    println!("  --help, -h                   Print this help message");
-    println!("  --version, -v                Print version information");
+    println!("Resident Daemon & System Commands:");
+    println!(
+        "  --run-foreground                    Run daemon in console with real-time event & trigger logging"
+    );
+    println!(
+        "  --register-startup                  Register application to start automatically on Windows boot"
+    );
+    println!("  --unregister-startup                Remove application from Windows startup");
+    println!("  --help, -h                          Print this help message");
+    println!("  --version, -v                       Print version information");
 }
 
 fn handle_generate_fixtures(args: &[String]) {
@@ -323,6 +331,97 @@ fn handle_generate_fixtures(args: &[String]) {
             );
         }
         Err(e) => eprintln!("Error generating fixtures: {}", e),
+    }
+}
+
+fn handle_shuffle_dry_run(args: &[String]) {
+    attach_parent_console();
+    if args.len() < 3 {
+        eprintln!("Usage: wallpaper-shuffler --shuffle-dry-run <IMAGE_DIR> [OUT_DIR]");
+        return;
+    }
+    let in_dir = PathBuf::from(&args[2]);
+    let out_dir = if args.len() > 3 {
+        PathBuf::from(&args[3])
+    } else {
+        PathBuf::from("target").join("test_output")
+    };
+
+    println!("=== Wallpaper Shuffle Dry Run (No OS wallpaper change) ===");
+    println!("Source Directory: {}", in_dir.display());
+    println!("Output Directory: {}\n", out_dir.display());
+
+    match composer::execute_shuffle_and_compose(&[in_dir], &out_dir, 10) {
+        Ok(res) => {
+            println!(">>> Composition Successful!");
+            println!("  Selected Mode:   {:?}", res.mode);
+            println!("  Processing Time: {}ms", res.duration_ms);
+            println!("  Saved Image:     {}", res.output_path.display());
+            println!("  Sources Used:    {} image(s)", res.source_images.len());
+            for (i, p) in res.source_images.iter().enumerate() {
+                println!(
+                    "    [{}] {}",
+                    i + 1,
+                    p.file_name().and_then(|s| s.to_str()).unwrap_or("")
+                );
+            }
+            println!("\nYou can inspect the generated 4K wallpaper at:");
+            println!(
+                "file:///{}",
+                res.output_path
+                    .canonicalize()
+                    .unwrap_or(res.output_path)
+                    .display()
+            );
+        }
+        Err(e) => eprintln!("Error during shuffle dry-run: {}", e),
+    }
+}
+
+fn handle_single_mode(mode: composer::CompositionMode, args: &[String], default_filename: &str) {
+    attach_parent_console();
+    if args.len() < 3 {
+        eprintln!(
+            "Usage: wallpaper-shuffler --compose-{:?} <IMAGE_DIR> [OUT_FILE]",
+            mode
+        );
+        return;
+    }
+    let in_dir = PathBuf::from(&args[2]);
+    let out_file = if args.len() > 3 {
+        PathBuf::from(&args[3])
+    } else {
+        PathBuf::from("target")
+            .join("test_output")
+            .join(default_filename)
+    };
+
+    println!("=== Compose Mode: {:?} ===", mode);
+    println!("Source: {}", in_dir.display());
+    println!("Output: {}\n", out_file.display());
+
+    let images = composer::collect_image_files(&[in_dir]);
+    if images.is_empty() {
+        eprintln!("No valid image files found in specified directory.");
+        return;
+    }
+
+    match composer::execute_mode_explicit(mode, &images, &out_file) {
+        Ok(res) => {
+            println!(
+                ">>> Successfully composed {:?} in {}ms!",
+                mode, res.duration_ms
+            );
+            println!("Saved to: {}", res.output_path.display());
+            println!(
+                "file:///{}",
+                res.output_path
+                    .canonicalize()
+                    .unwrap_or(res.output_path)
+                    .display()
+            );
+        }
+        Err(e) => eprintln!("Failed to compose {:?}: {}", mode, e),
     }
 }
 
@@ -481,6 +580,34 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
+            "--shuffle-dry-run" => {
+                handle_shuffle_dry_run(&args);
+                return;
+            }
+            "--compose-collage" => {
+                handle_single_mode(
+                    composer::CompositionMode::Collage,
+                    &args,
+                    "collage_custom.jpg",
+                );
+                return;
+            }
+            "--compose-tiling" => {
+                handle_single_mode(
+                    composer::CompositionMode::Tiling,
+                    &args,
+                    "tiling_custom.jpg",
+                );
+                return;
+            }
+            "--compose-single" => {
+                handle_single_mode(
+                    composer::CompositionMode::Single,
+                    &args,
+                    "single_custom.jpg",
+                );
+                return;
+            }
             "--generate-fixtures" => {
                 handle_generate_fixtures(&args);
                 return;
