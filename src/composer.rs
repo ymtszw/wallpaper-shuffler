@@ -50,7 +50,7 @@ impl RectI32 {
     }
 }
 
-/// Only landscape images (width > height) with horizontal resolution >= 3000px and 16:9 approx
+/// Only landscape images (width > height) with horizontal resolution >= 3000px
 pub fn is_single_candidate(path: &Path) -> bool {
     let Ok(reader) = ImageReader::open(path) else {
         return false;
@@ -63,13 +63,10 @@ pub fn is_single_candidate(path: &Path) -> bool {
     };
 
     if width <= height {
-        return false; // Strictly landscape only
+        return false; // Strictly landscape only, never vertical/square
     }
 
-    let aspect = width as f64 / height as f64;
-    let target_aspect = 16.0 / 9.0;
-    let aspect_diff = (aspect - target_aspect).abs();
-    width >= 3000 && aspect_diff < 0.35
+    width >= 3000
 }
 
 pub fn load_rgb_image(path: &Path) -> Result<RgbImage, String> {
@@ -98,17 +95,29 @@ pub fn fit_downscale_only(src: &RgbImage, max_dim: u32) -> RgbImage {
     resize(src, nw, nh, FilterType::Triangle)
 }
 
-/// Mode A: Single 4K wallpaper fit (strictly landscape >= 3000px)
+/// Mode A: Single 4K wallpaper fit (strictly landscape width > height)
 pub fn compose_single(src_path: &Path) -> Result<RgbImage, String> {
     let src = load_rgb_image(src_path)?;
-    let sw = src.width() as f64;
-    let sh = src.height() as f64;
+    let sw = src.width();
+    let sh = src.height();
+
+    if sw <= sh {
+        return Err(format!(
+            "Cannot use portrait image '{}' ({}x{}) for Single wallpaper mode (strictly landscape width > height required)",
+            src_path.display(),
+            sw,
+            sh
+        ));
+    }
+
+    let sw_f = sw as f64;
+    let sh_f = sh as f64;
     let tw = CANVAS_WIDTH_4K as f64;
     let th = CANVAS_HEIGHT_4K as f64;
 
-    let scale = (tw / sw).max(th / sh);
-    let nw = ((sw * scale).round() as u32).max(CANVAS_WIDTH_4K);
-    let nh = ((sh * scale).round() as u32).max(CANVAS_HEIGHT_4K);
+    let scale = (tw / sw_f).max(th / sh_f);
+    let nw = ((sw_f * scale).round() as u32).max(CANVAS_WIDTH_4K);
+    let nh = ((sh_f * scale).round() as u32).max(CANVAS_HEIGHT_4K);
 
     let resized = resize(&src, nw, nh, FilterType::Triangle);
     let crop_x = (nw - CANVAS_WIDTH_4K) / 2;
@@ -846,7 +855,16 @@ pub fn collect_image_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let valid_exts = ["jpg", "jpeg", "png", "webp"];
 
     for dir in dirs {
-        if let Ok(entries) = fs::read_dir(dir) {
+        if dir.is_file() {
+            let has_valid_ext = dir
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| valid_exts.contains(&ext.to_lowercase().as_str()))
+                .unwrap_or(false);
+            if has_valid_ext {
+                files.push(dir.clone());
+            }
+        } else if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
@@ -968,10 +986,16 @@ pub fn execute_mode_explicit(
 
     let (composed, used) = match mode {
         CompositionMode::Single => {
-            let single_img = images
-                .iter()
-                .find(|p| is_single_candidate(p))
-                .unwrap_or(&images[0]);
+            let single_img = if images.len() == 1 {
+                &images[0]
+            } else {
+                images
+                    .iter()
+                    .find(|p| is_single_candidate(p))
+                    .ok_or_else(|| {
+                        "No qualifying landscape 4K candidate (width > height and width >= 3000px) found in images".to_string()
+                    })?
+            };
             let img = compose_single(single_img)?;
             (img, vec![single_img.clone()])
         }
@@ -1043,5 +1067,22 @@ mod tests {
         let comp_h = (h + 180.0) % 360.0;
         let rgb_comp = hsv_to_rgb(comp_h, s, v);
         assert!(rgb_comp[0] > rgb_comp[2]); // Opposite warm hue
+    }
+
+    #[test]
+    fn test_single_mode_strictly_rejects_portrait() {
+        let temp_dir = std::env::temp_dir().join("wallpaper_shuffler_test");
+        let _ = fs::create_dir_all(&temp_dir);
+        let portrait_path = temp_dir.join("test_portrait.png");
+        let portrait_img = RgbImage::from_pixel(1600, 2500, Rgb([100, 150, 200]));
+        portrait_img.save(&portrait_path).unwrap();
+
+        // Must reject portrait image (width <= height)
+        assert!(!is_single_candidate(&portrait_path));
+        let res = compose_single(&portrait_path);
+        assert!(res.is_err(), "compose_single must fail on portrait image");
+
+        // Clean up
+        let _ = fs::remove_file(&portrait_path);
     }
 }

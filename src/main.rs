@@ -451,22 +451,24 @@ fn handle_test_compose(args: &[String]) {
 
     // 1. Single Mode Test
     println!("[1/3] Testing Single Image Fit Mode (4K 3840x2160)...");
-    let single_cand = images
-        .iter()
-        .find(|p| composer::is_single_candidate(p))
-        .unwrap_or(&images[0]);
-    let out_single = out_dir.join("01_sample_single.jpg");
-    match composer::execute_mode_explicit(
-        composer::CompositionMode::Single,
-        std::slice::from_ref(single_cand),
-        &out_single,
-    ) {
-        Ok(res) => println!(
-            "  -> Generated {} in {}ms",
-            res.output_path.display(),
-            res.duration_ms
-        ),
-        Err(e) => eprintln!("  -> Failed: {}", e),
+    if let Some(single_cand) = images.iter().find(|p| composer::is_single_candidate(p)) {
+        let out_single = out_dir.join("01_sample_single.jpg");
+        match composer::execute_mode_explicit(
+            composer::CompositionMode::Single,
+            std::slice::from_ref(single_cand),
+            &out_single,
+        ) {
+            Ok(res) => println!(
+                "  -> Generated {} in {}ms",
+                res.output_path.display(),
+                res.duration_ms
+            ),
+            Err(e) => eprintln!("  -> Failed: {}", e),
+        }
+    } else {
+        println!(
+            "  -> Skipped: No images qualify for Single 4K mode (requires landscape width > height and width >= 3000px)."
+        );
     }
 
     // 2. Collage Mode Test
@@ -524,25 +526,25 @@ fn handle_benchmark(args: &[String]) {
     let iterations = 5;
 
     // Benchmark Single
-    let single_cand = images
-        .iter()
-        .find(|p| composer::is_single_candidate(p))
-        .unwrap_or(&images[0]);
-    let mut single_times = Vec::new();
-    for _ in 0..iterations {
-        let res = composer::execute_mode_explicit(
-            composer::CompositionMode::Single,
-            std::slice::from_ref(single_cand),
-            &temp_out,
-        )
-        .expect("benchmark single");
-        single_times.push(res.duration_ms);
+    if let Some(single_cand) = images.iter().find(|p| composer::is_single_candidate(p)) {
+        let mut single_times = Vec::new();
+        for _ in 0..iterations {
+            let res = composer::execute_mode_explicit(
+                composer::CompositionMode::Single,
+                std::slice::from_ref(single_cand),
+                &temp_out,
+            )
+            .expect("benchmark single");
+            single_times.push(res.duration_ms);
+        }
+        let avg_single = single_times.iter().sum::<u128>() as f64 / iterations as f64;
+        println!(
+            "Single 4K Fit:   avg {:.1}ms (runs: {:?})",
+            avg_single, single_times
+        );
+    } else {
+        println!("Single 4K Fit:   skipped (no landscape images >= 3000px)");
     }
-    let avg_single = single_times.iter().sum::<u128>() as f64 / iterations as f64;
-    println!(
-        "Single 4K Fit:   avg {:.1}ms (runs: {:?})",
-        avg_single, single_times
-    );
 
     // Benchmark Collage
     let mut collage_times = Vec::new();
