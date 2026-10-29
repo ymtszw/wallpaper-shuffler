@@ -176,112 +176,6 @@ pub fn compose_single(src_path: &Path) -> Result<RgbImage, String> {
     Ok(crop_imm(&resized, crop_x, crop_y, CANVAS_WIDTH_4K, CANVAS_HEIGHT_4K).to_image())
 }
 
-pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
-    let rf = r as f32 / 255.0;
-    let gf = g as f32 / 255.0;
-    let bf = b as f32 / 255.0;
-
-    let max = rf.max(gf.max(bf));
-    let min = rf.min(gf.min(bf));
-    let delta = max - min;
-
-    let hue = if delta == 0.0 {
-        0.0
-    } else if max == rf {
-        60.0 * (((gf - bf) / delta).rem_euclid(6.0))
-    } else if max == gf {
-        60.0 * (((bf - rf) / delta) + 2.0)
-    } else {
-        60.0 * (((rf - gf) / delta) + 4.0)
-    };
-
-    let sat = if max == 0.0 { 0.0 } else { delta / max };
-    let val = max;
-
-    (hue, sat, val)
-}
-
-pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
-    let c = v * s;
-    let h_prime = (h.rem_euclid(360.0)) / 60.0;
-    let x = c * (1.0 - ((h_prime % 2.0) - 1.0).abs());
-    let m = v - c;
-
-    let (r1, g1, b1) = if h_prime < 1.0 {
-        (c, x, 0.0)
-    } else if h_prime < 2.0 {
-        (x, c, 0.0)
-    } else if h_prime < 3.0 {
-        (0.0, c, x)
-    } else if h_prime < 4.0 {
-        (0.0, x, c)
-    } else if h_prime < 5.0 {
-        (x, 0.0, c)
-    } else {
-        (c, 0.0, x)
-    };
-
-    [
-        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
-        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
-        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
-    ]
-}
-
-/// Explores dominant representative color from images and generates a complementary desaturated gradient
-pub fn compute_complementary_gradient(images: &[RgbImage]) -> ([u8; 3], [u8; 3]) {
-    // 12-bin histogram for hue (each 30 degrees)
-    let mut hue_bins = [0u32; 12];
-    let mut total_sat = 0.0f32;
-    let mut valid_samples = 0u32;
-
-    for img in images {
-        let step_x = (img.width() / 20).max(1);
-        let step_y = (img.height() / 20).max(1);
-        for y in (0..img.height()).step_by(step_y as usize) {
-            for x in (0..img.width()).step_by(step_x as usize) {
-                let p = img.get_pixel(x, y);
-                let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
-                // Filter out near-neutral / pure black / pure white
-                if s > 0.15 && v > 0.15 && v < 0.95 {
-                    let bin = ((h / 30.0).floor() as usize).min(11);
-                    hue_bins[bin] += 1;
-                    total_sat += s;
-                    valid_samples += 1;
-                }
-            }
-        }
-    }
-
-    // Dominant hue bin
-    let dominant_hue = if valid_samples > 0 {
-        let (max_bin, _) = hue_bins
-            .iter()
-            .enumerate()
-            .max_by_key(|&(_, &count)| count)
-            .unwrap_or((7, &0));
-        (max_bin as f32 * 30.0) + 15.0
-    } else {
-        210.0 // Default cool slate blue if images are monochrome
-    };
-
-    // Complementary hue (opposite phase: 180 degrees)
-    let comp_hue = (dominant_hue + 180.0).rem_euclid(360.0);
-
-    // Muted low saturation dynamically scaled from image content
-    let sat = if valid_samples > 0 {
-        (total_sat / valid_samples as f32 * 0.5).clamp(0.12, 0.28)
-    } else {
-        0.20
-    };
-
-    // Gradient toward dark tones (value ~0.32 down to ~0.13)
-    let c1 = hsv_to_rgb(comp_hue, sat, 0.32);
-    let c2 = hsv_to_rgb(comp_hue, sat * 0.8, 0.13);
-
-    (c1, c2)
-}
-
 /// Create smooth ambient canvas with subtle color fluctuation
 pub fn create_styled_background(
     w: u32,
@@ -297,18 +191,29 @@ pub fn create_styled_background(
     let cy = hf * rng.gen_range(0.45..0.55);
     let max_dist = (cx * cx + cy * cy).sqrt();
 
+    // Fast 1D lookup tables to avoid 8.3 million trigonometric calls per 4K frame
+    let sin_lut: Vec<f32> = (0..w).map(|x| (x as f32 * 0.003).sin()).collect();
+    let cos_lut: Vec<f32> = (0..h).map(|y| (y as f32 * 0.003).cos()).collect();
+
+    let c1_f = [c1[0] as f32, c1[1] as f32, c1[2] as f32];
+    let diff_f = [
+        c2[0] as f32 - c1_f[0],
+        c2[1] as f32 - c1_f[1],
+        c2[2] as f32 - c1_f[2],
+    ];
+
     for (x, y, pixel) in bg.enumerate_pixels_mut() {
         let dx = x as f32 - cx;
         let dy = y as f32 - cy;
         let dist = (dx * dx + dy * dy).sqrt() / max_dist;
         let t = dist.clamp(0.0, 1.0);
 
-        let wobble = (((x as f32) * 0.003).sin() * ((y as f32) * 0.003).cos()) * 0.04;
+        let wobble = (sin_lut[x as usize] * cos_lut[y as usize]) * 0.04;
         let blend = (t + wobble).clamp(0.0, 1.0);
 
-        let r = (c1[0] as f32 * (1.0 - blend) + c2[0] as f32 * blend) as u8;
-        let g = (c1[1] as f32 * (1.0 - blend) + c2[1] as f32 * blend) as u8;
-        let b = (c1[2] as f32 * (1.0 - blend) + c2[2] as f32 * blend) as u8;
+        let r = (c1_f[0] + diff_f[0] * blend) as u8;
+        let g = (c1_f[1] + diff_f[1] * blend) as u8;
+        let b = (c1_f[2] + diff_f[2] * blend) as u8;
 
         *pixel = Rgb([r, g, b]);
     }
@@ -1127,14 +1032,6 @@ mod tests {
         let rotated = rotate_rgba(&card, 0.15);
         assert!(rotated.width() >= 200);
         assert!(rotated.height() >= 300);
-    }
-
-    #[test]
-    fn test_hsv_conversion_complementary() {
-        let (h, s, v) = rgb_to_hsv(0, 100, 200);
-        let comp_h = (h + 180.0) % 360.0;
-        let rgb_comp = hsv_to_rgb(comp_h, s, v);
-        assert!(rgb_comp[0] > rgb_comp[2]); // Opposite warm hue
     }
 
     #[test]
