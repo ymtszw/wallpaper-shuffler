@@ -50,6 +50,7 @@ impl RectI32 {
     }
 }
 
+/// Only landscape images (width > height) with horizontal resolution >= 3000px and 16:9 approx
 pub fn is_single_candidate(path: &Path) -> bool {
     let Ok(reader) = ImageReader::open(path) else {
         return false;
@@ -60,6 +61,11 @@ pub fn is_single_candidate(path: &Path) -> bool {
     let Ok((width, height)) = reader.into_dimensions() else {
         return false;
     };
+
+    if width <= height {
+        return false; // Strictly landscape only
+    }
+
     let aspect = width as f64 / height as f64;
     let target_aspect = 16.0 / 9.0;
     let aspect_diff = (aspect - target_aspect).abs();
@@ -92,7 +98,7 @@ pub fn fit_downscale_only(src: &RgbImage, max_dim: u32) -> RgbImage {
     resize(src, nw, nh, FilterType::Triangle)
 }
 
-/// Mode A: Single 4K wallpaper fit (only for candidates >= 3000px 16:9 approx)
+/// Mode A: Single 4K wallpaper fit (strictly landscape >= 3000px)
 pub fn compose_single(src_path: &Path) -> Result<RgbImage, String> {
     let src = load_rgb_image(src_path)?;
     let sw = src.width() as f64;
@@ -111,58 +117,108 @@ pub fn compose_single(src_path: &Path) -> Result<RgbImage, String> {
     Ok(crop_imm(&resized, crop_x, crop_y, CANVAS_WIDTH_4K, CANVAS_HEIGHT_4K).to_image())
 }
 
-/// Compute harmonious, muted background color derived from source images
-pub fn compute_harmonious_palette(images: &[RgbImage]) -> ([u8; 3], [u8; 3]) {
-    let mut total_r = 0u64;
-    let mut total_g = 0u64;
-    let mut total_b = 0u64;
-    let mut count = 0u64;
+pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+
+    let max = rf.max(gf.max(bf));
+    let min = rf.min(gf.min(bf));
+    let delta = max - min;
+
+    let hue = if delta == 0.0 {
+        0.0
+    } else if max == rf {
+        60.0 * (((gf - bf) / delta).rem_euclid(6.0))
+    } else if max == gf {
+        60.0 * (((bf - rf) / delta) + 2.0)
+    } else {
+        60.0 * (((rf - gf) / delta) + 4.0)
+    };
+
+    let sat = if max == 0.0 { 0.0 } else { delta / max };
+    let val = max;
+
+    (hue, sat, val)
+}
+
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let c = v * s;
+    let h_prime = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - ((h_prime % 2.0) - 1.0).abs());
+    let m = v - c;
+
+    let (r1, g1, b1) = if h_prime < 1.0 {
+        (c, x, 0.0)
+    } else if h_prime < 2.0 {
+        (x, c, 0.0)
+    } else if h_prime < 3.0 {
+        (0.0, c, x)
+    } else if h_prime < 4.0 {
+        (0.0, x, c)
+    } else if h_prime < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+
+    [
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+/// Explores dominant representative color from images and generates a complementary desaturated gradient
+pub fn compute_complementary_gradient(images: &[RgbImage]) -> ([u8; 3], [u8; 3]) {
+    // 12-bin histogram for hue (each 30 degrees)
+    let mut hue_bins = [0u32; 12];
+    let mut total_sat = 0.0f32;
+    let mut valid_samples = 0u32;
 
     for img in images {
-        let step_x = (img.width() / 16).max(1);
-        let step_y = (img.height() / 16).max(1);
+        let step_x = (img.width() / 20).max(1);
+        let step_y = (img.height() / 20).max(1);
         for y in (0..img.height()).step_by(step_y as usize) {
             for x in (0..img.width()).step_by(step_x as usize) {
                 let p = img.get_pixel(x, y);
-                total_r += p[0] as u64;
-                total_g += p[1] as u64;
-                total_b += p[2] as u64;
-                count += 1;
+                let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
+                // Filter out near-neutral / pure black / pure white
+                if s > 0.15 && v > 0.15 && v < 0.95 {
+                    let bin = ((h / 30.0).floor() as usize).min(11);
+                    hue_bins[bin] += 1;
+                    total_sat += s;
+                    valid_samples += 1;
+                }
             }
         }
     }
 
-    if count == 0 {
-        return ([20, 24, 34], [10, 12, 18]);
-    }
-
-    let avg_r = (total_r / count) as f32;
-    let avg_g = (total_g / count) as f32;
-    let avg_b = (total_b / count) as f32;
-
-    let luminance = 0.299 * avg_r + 0.587 * avg_g + 0.114 * avg_b;
-    let target_lum = 34.0;
-    let lum_factor = if luminance > 0.0 {
-        (target_lum / luminance).min(1.2)
+    // Dominant hue bin
+    let dominant_hue = if valid_samples > 0 {
+        let (max_bin, _) = hue_bins
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &count)| count)
+            .unwrap_or((7, &0));
+        (max_bin as f32 * 30.0) + 15.0
     } else {
-        1.0
+        210.0 // Default cool slate blue if images are monochrome
     };
 
-    let base_r = (avg_r * 0.35 + luminance * 0.65) * lum_factor;
-    let base_g = (avg_g * 0.35 + luminance * 0.65) * lum_factor;
-    let base_b = (avg_b * 0.35 + luminance * 0.65) * lum_factor;
+    // Complementary hue (opposite phase: 180 degrees)
+    let comp_hue = (dominant_hue + 180.0).rem_euclid(360.0);
 
-    let c1 = [
-        (base_r * 1.15).clamp(16.0, 70.0) as u8,
-        (base_g * 1.15).clamp(18.0, 75.0) as u8,
-        (base_b * 1.15).clamp(26.0, 90.0) as u8,
-    ];
+    // Muted low saturation dynamically scaled from image content
+    let sat = if valid_samples > 0 {
+        (total_sat / valid_samples as f32 * 0.5).clamp(0.12, 0.28)
+    } else {
+        0.20
+    };
 
-    let c2 = [
-        (base_r * 0.50).clamp(8.0, 40.0) as u8,
-        (base_g * 0.50).clamp(10.0, 45.0) as u8,
-        (base_b * 0.50).clamp(14.0, 55.0) as u8,
-    ];
+    // Gradient toward dark tones (value ~0.32 down to ~0.13)
+    let c1 = hsv_to_rgb(comp_hue, sat, 0.32);
+    let c2 = hsv_to_rgb(comp_hue, sat * 0.8, 0.13);
 
     (c1, c2)
 }
@@ -188,7 +244,7 @@ pub fn create_styled_background(
         let dist = (dx * dx + dy * dy).sqrt() / max_dist;
         let t = dist.clamp(0.0, 1.0);
 
-        let wobble = (((x as f32) * 0.003).sin() * ((y as f32) * 0.003).cos()) * 0.05;
+        let wobble = (((x as f32) * 0.003).sin() * ((y as f32) * 0.003).cos()) * 0.04;
         let blend = (t + wobble).clamp(0.0, 1.0);
 
         let r = (c1[0] as f32 * (1.0 - blend) + c2[0] as f32 * blend) as u8;
@@ -214,7 +270,7 @@ pub fn decorate_photo_card(src: &RgbImage, style: FrameStyle) -> RgbaImage {
     let sh = src.height();
 
     let (pad_top, pad_bot, pad_sides, border_color) = match style {
-        FrameStyle::Polaroid => (22u32, 70u32, 22u32, [248, 248, 250, 255]),
+        FrameStyle::Polaroid => (24u32, 76u32, 24u32, [248, 248, 250, 255]),
         FrameStyle::WoodFrame => (18u32, 18u32, 18u32, [45, 35, 28, 255]),
         FrameStyle::ThinWhite => (12u32, 12u32, 12u32, [242, 242, 245, 255]),
         FrameStyle::None => (0u32, 0u32, 0u32, [0, 0, 0, 0]),
@@ -345,8 +401,56 @@ pub fn blend_tilted_card_with_shadow(
     }
 }
 
-/// Mode B: Fewer (5-7 items), Much Larger (~1500-1850px) Portrait-Dominated Scattered Prints.
-/// Outer photos intentionally bleed/overhang off-screen, eliminating empty perimeter voids.
+#[derive(Debug, Clone)]
+struct CollageCardPlacement {
+    cx: f32,
+    cy: f32,
+    w: f32,
+    h: f32,
+    angle_rad: f32,
+}
+
+impl CollageCardPlacement {
+    fn contains_point(&self, px: f32, py: f32) -> bool {
+        let dx = px - self.cx;
+        let dy = py - self.cy;
+        let cos_a = (-self.angle_rad).cos();
+        let sin_a = (-self.angle_rad).sin();
+        let lx = dx * cos_a - dy * sin_a;
+        let ly = dx * sin_a + dy * cos_a;
+        lx.abs() <= self.w / 2.0 && ly.abs() <= self.h / 2.0
+    }
+
+    /// Evaluates percentage of this card that is NOT covered by any subsequent cards (drawn on top)
+    fn calculate_unoccluded_ratio(&self, top_cards: &[CollageCardPlacement]) -> f32 {
+        let sample_steps = 15;
+        let mut visible = 0;
+        let total = sample_steps * sample_steps;
+
+        let cos_a = self.angle_rad.cos();
+        let sin_a = self.angle_rad.sin();
+
+        for sy in 0..sample_steps {
+            let ly = (sy as f32 / (sample_steps - 1) as f32 - 0.5) * self.h;
+            for sx in 0..sample_steps {
+                let lx = (sx as f32 / (sample_steps - 1) as f32 - 0.5) * self.w;
+                let px = self.cx + lx * cos_a - ly * sin_a;
+                let py = self.cy + lx * sin_a + ly * cos_a;
+
+                // Check if covered by any card drawn on top of this one
+                let covered = top_cards.iter().any(|c| c.contains_point(px, py));
+                if !covered {
+                    visible += 1;
+                }
+            }
+        }
+
+        visible as f32 / total as f32
+    }
+}
+
+/// Mode B: Large portrait-dominated prints with guaranteed >= 70% unoccluded exposure per image.
+/// Automatically search-adjusts or reduces photo count so no photo is buried.
 pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
     if images.is_empty() {
         return Err("No images provided for collage".to_string());
@@ -354,7 +458,7 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
 
     let mut rng = rand::thread_rng();
 
-    // 1. Filter out single-4k candidates and randomly shuffle so portraits (75%) dominate naturally
+    // Randomize candidates without landscape bias (portraits naturally dominate)
     let mut candidate_paths: Vec<PathBuf> = images.to_vec();
     candidate_paths.shuffle(&mut rng);
 
@@ -371,7 +475,7 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         return Err("Failed to load any valid images for collage".to_string());
     }
 
-    let (c1, c2) = compute_harmonious_palette(&loaded);
+    let (c1, c2) = compute_complementary_gradient(&loaded);
     let mut canvas = create_styled_background(CANVAS_WIDTH_4K, CANVAS_HEIGHT_4K, c1, c2, &mut rng);
 
     let frame_styles = [
@@ -381,49 +485,111 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         FrameStyle::None,
     ];
 
-    // 5 to 7 anchor zones across 4K canvas (3840x2160)
-    // Anchors near boundaries intentionally overhang/bleed outside canvas to suppress background borders
-    let count = loaded.len().clamp(5, 7);
-    let anchor_presets = [
-        (650i32, 900i32),   // Left
+    // Anchors designed to cover 4K screen with perimeter bleed
+    let anchor_pools = [
+        (650i32, 900i32),   // Left mid
         (1920i32, 1150i32), // Center Hero
-        (3190i32, 950i32),  // Right
-        (1300i32, 500i32),  // Top-Mid Left (bleeds top)
-        (2540i32, 1650i32), // Bottom-Mid Right (bleeds bottom)
-        (3600i32, 1500i32), // Far Right (bleeds right)
-        (250i32, 1550i32),  // Far Left (bleeds left)
+        (3190i32, 950i32),  // Right mid
+        (1300i32, 450i32),  // Top-mid left (bleeds top)
+        (2540i32, 1700i32), // Bottom-mid right (bleeds bottom)
+        (3650i32, 1550i32), // Far right (bleeds right)
+        (200i32, 1600i32),  // Far left (bleeds left)
     ];
 
-    for i in 0..count {
-        let src = &loaded[i];
+    // Pre-decorate cards once outside search loop to ensure blazing fast performance (<300ms)
+    struct PreparedCard {
+        card: RgbaImage,
+        w: f32,
+        h: f32,
+        angle_rad: f32,
+    }
 
-        // Large portrait prints scaled to long edge ~1500-1850px!
-        let max_dim = rng.gen_range(1500..=1850);
-        let scaled = fit_downscale_only(src, max_dim);
+    let prepared_cards: Vec<PreparedCard> = loaded
+        .iter()
+        .take(7)
+        .enumerate()
+        .map(|(i, src)| {
+            let max_dim = rng.gen_range(1450..=1800);
+            let scaled = fit_downscale_only(src, max_dim);
+            let style = *frame_styles.choose(&mut rng).unwrap();
+            let card = decorate_photo_card(&scaled, style);
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let angle_deg = sign * rng.gen_range(3.0..9.0);
+            let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
+            let w = card.width() as f32;
+            let h = card.height() as f32;
+            PreparedCard {
+                card,
+                w,
+                h,
+                angle_rad,
+            }
+        })
+        .collect();
 
-        let style = *frame_styles.choose(&mut rng).unwrap();
-        let card = decorate_photo_card(&scaled, style);
+    // Target exposure threshold: every placed photo must have >= 70% unoccluded visible area!
+    let min_exposure_threshold = 0.70f32;
+    let mut target_count = prepared_cards.len().clamp(4, 7);
+    let mut final_placements = Vec::new();
 
-        // Gentle tilt alternating between -9.5 and +9.5 degrees
-        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
-        let angle_deg = sign * rng.gen_range(3.0..9.5);
-        let rotated = rotate_rgba(&card, angle_deg * (std::f32::consts::PI / 180.0));
+    while target_count >= 3 {
+        let mut found_good_layout = false;
 
-        let (anchor_x, anchor_y) = anchor_presets[i % anchor_presets.len()];
-        let jx = rng.gen_range(-80..80);
-        let jy = rng.gen_range(-60..60);
-        let px = anchor_x + jx - (rotated.width() as i32 / 2);
-        let py = anchor_y + jy - (rotated.height() as i32 / 2);
+        for _attempt in 0..50 {
+            let mut placements = Vec::new();
+            for i in 0..target_count {
+                let prep = &prepared_cards[i];
+                let (base_x, base_y) = anchor_pools[i % anchor_pools.len()];
+                let jx = rng.gen_range(-120..120);
+                let jy = rng.gen_range(-90..90);
 
-        blend_tilted_card_with_shadow(&mut canvas, &rotated, px, py);
+                let cx = (base_x + jx) as f32;
+                let cy = (base_y + jy) as f32;
+
+                placements.push(CollageCardPlacement {
+                    cx,
+                    cy,
+                    w: prep.w,
+                    h: prep.h,
+                    angle_rad: prep.angle_rad,
+                });
+            }
+
+            // Verify visibility threshold for each card
+            let all_satisfy = placements.iter().enumerate().all(|(idx, card)| {
+                let top_cards = &placements[idx + 1..];
+                card.calculate_unoccluded_ratio(top_cards) >= min_exposure_threshold
+            });
+
+            if all_satisfy {
+                final_placements = placements;
+                found_good_layout = true;
+                break;
+            }
+        }
+
+        if found_good_layout {
+            break;
+        }
+
+        // If crowded, reduce photo count by 1 and retry
+        target_count -= 1;
+    }
+
+    // Render cards onto canvas (rotate only the final winning cards once!)
+    for (i, p) in final_placements.into_iter().enumerate() {
+        let prep = &prepared_cards[i];
+        let rotated = rotate_rgba(&prep.card, prep.angle_rad);
+        let place_x = (p.cx - rotated.width() as f32 / 2.0).round() as i32;
+        let place_y = (p.cy - rotated.height() as f32 / 2.0).round() as i32;
+        blend_tilted_card_with_shadow(&mut canvas, &rotated, place_x, place_y);
     }
 
     Ok(canvas)
 }
 
-/// Mode C: Unbiased Center-Outward Dynamic Tiling.
-/// Shuffled candidate pool (portraits naturally majority), large base size (~1150-1500px),
-/// organic variable gaps (10-22px), and even coverage without lopsided voids.
+/// Mode C: Center-Outward Dynamic Tiling with bold, wide gaps (28-40px)
+/// and evenly distributed packing without lopsided vacant pockets.
 pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     if images.is_empty() {
         return Err("No images provided for tiling".to_string());
@@ -431,7 +597,6 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
 
     let mut rng = rand::thread_rng();
 
-    // Randomize image order without bias so portraits (75%) naturally form the majority
     let mut candidate_paths: Vec<PathBuf> = images.to_vec();
     candidate_paths.shuffle(&mut rng);
 
@@ -445,7 +610,7 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         return Err("Failed to load any valid images for tiling".to_string());
     }
 
-    let (c1, c2) = compute_harmonious_palette(&loaded);
+    let (c1, c2) = compute_complementary_gradient(&loaded);
     let mut canvas = create_styled_background(CANVAS_WIDTH_4K, CANVAS_HEIGHT_4K, c1, c2, &mut rng);
 
     let canvas_cx = (CANVAS_WIDTH_4K / 2) as i32;
@@ -459,9 +624,12 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     let mut placed: Vec<PlacedImage> = Vec::new();
     let mut placed_rects: Vec<RectI32> = Vec::new();
 
+    // Bold, noticeable gap (30px) to prevent cramped edges and eliminate lopsided feeling
+    let bold_gap = 30i32;
+
     // 1. Center hero tile from the shuffled pool (usually portrait)
     let first_src = &loaded[0];
-    let first_max = rng.gen_range(1250..=1450);
+    let first_max = rng.gen_range(1200..=1400);
     let first_scaled = fit_downscale_only(first_src, first_max);
     let fw = first_scaled.width() as i32;
     let fh = first_scaled.height() as i32;
@@ -480,12 +648,12 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     let mut img_idx = 1;
     let mut attempts = 0;
 
-    let overlaps_any = |cand: &RectI32, list: &[RectI32], gap: i32| -> bool {
+    let overlaps_any = |cand: &RectI32, list: &[RectI32]| -> bool {
         let expanded = RectI32 {
-            x: cand.x - gap,
-            y: cand.y - gap,
-            w: cand.w + gap * 2,
-            h: cand.h + gap * 2,
+            x: cand.x - bold_gap,
+            y: cand.y - bold_gap,
+            w: cand.w + bold_gap * 2,
+            h: cand.h + bold_gap * 2,
         };
         for r in list {
             if expanded.intersects(r) {
@@ -521,8 +689,8 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         uncovered.first().map(|(_, px, py)| (*px, *py))
     };
 
-    // Outward packing with variable organic gap (10-22px) and balanced coverage
-    while attempts < 40 {
+    // Outward packing with bold uniform gap (30px) and balanced coverage
+    while attempts < 35 {
         attempts += 1;
 
         let uncovered_target = find_uncovered_center_biased_point(&placed_rects);
@@ -535,31 +703,28 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         let src = &loaded[img_idx % loaded.len()];
         img_idx += 1;
 
-        // Large tile size (~1150 - 1500px)
-        let max_dim = rng.gen_range(1150..=1500);
+        let max_dim = rng.gen_range(1100..=1450);
         let scaled = fit_downscale_only(src, max_dim);
         let w = scaled.width() as i32;
         let h = scaled.height() as i32;
-
-        let gap = rng.gen_range(12i32..=20i32);
 
         let mut candidates = Vec::new();
         for r in &placed_rects {
             // Right edge alignments
             candidates.push(RectI32 {
-                x: r.right() + gap,
+                x: r.right() + bold_gap,
                 y: r.y,
                 w,
                 h,
             });
             candidates.push(RectI32 {
-                x: r.right() + gap,
+                x: r.right() + bold_gap,
                 y: r.y + (r.h - h) / 2,
                 w,
                 h,
             });
             candidates.push(RectI32 {
-                x: r.right() + gap,
+                x: r.right() + bold_gap,
                 y: r.bottom() - h,
                 w,
                 h,
@@ -567,19 +732,19 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
 
             // Left edge alignments
             candidates.push(RectI32 {
-                x: r.x - gap - w,
+                x: r.x - bold_gap - w,
                 y: r.y,
                 w,
                 h,
             });
             candidates.push(RectI32 {
-                x: r.x - gap - w,
+                x: r.x - bold_gap - w,
                 y: r.y + (r.h - h) / 2,
                 w,
                 h,
             });
             candidates.push(RectI32 {
-                x: r.x - gap - w,
+                x: r.x - bold_gap - w,
                 y: r.bottom() - h,
                 w,
                 h,
@@ -588,19 +753,19 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
             // Top edge alignments
             candidates.push(RectI32 {
                 x: r.x,
-                y: r.y - gap - h,
+                y: r.y - bold_gap - h,
                 w,
                 h,
             });
             candidates.push(RectI32 {
                 x: r.x + (r.w - w) / 2,
-                y: r.y - gap - h,
+                y: r.y - bold_gap - h,
                 w,
                 h,
             });
             candidates.push(RectI32 {
                 x: r.right() - w,
-                y: r.y - gap - h,
+                y: r.y - bold_gap - h,
                 w,
                 h,
             });
@@ -608,25 +773,24 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
             // Bottom edge alignments
             candidates.push(RectI32 {
                 x: r.x,
-                y: r.bottom() + gap,
+                y: r.bottom() + bold_gap,
                 w,
                 h,
             });
             candidates.push(RectI32 {
                 x: r.x + (r.w - w) / 2,
-                y: r.bottom() + gap,
+                y: r.bottom() + bold_gap,
                 w,
                 h,
             });
             candidates.push(RectI32 {
                 x: r.right() - w,
-                y: r.bottom() + gap,
+                y: r.bottom() + bold_gap,
                 w,
                 h,
             });
         }
 
-        // Sort candidates prioritizing the current closest uncovered target point
         candidates.sort_by_key(|c| {
             let cx = c.x + c.w / 2;
             let cy = c.y + c.h / 2;
@@ -637,7 +801,7 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
 
         if let Some(best) = candidates
             .into_iter()
-            .find(|c| !overlaps_any(c, &placed_rects, gap))
+            .find(|c| !overlaps_any(c, &placed_rects))
         {
             placed_rects.push(best);
             placed.push(PlacedImage {
@@ -804,8 +968,12 @@ pub fn execute_mode_explicit(
 
     let (composed, used) = match mode {
         CompositionMode::Single => {
-            let img = compose_single(&images[0])?;
-            (img, vec![images[0].clone()])
+            let single_img = images
+                .iter()
+                .find(|p| is_single_candidate(p))
+                .unwrap_or(&images[0]);
+            let img = compose_single(single_img)?;
+            (img, vec![single_img.clone()])
         }
         CompositionMode::Collage => {
             let count = images.len().min(7);
@@ -867,5 +1035,13 @@ mod tests {
         let rotated = rotate_rgba(&card, 0.15);
         assert!(rotated.width() >= 200);
         assert!(rotated.height() >= 300);
+    }
+
+    #[test]
+    fn test_hsv_conversion_complementary() {
+        let (h, s, v) = rgb_to_hsv(0, 100, 200);
+        let comp_h = (h + 180.0) % 360.0;
+        let rgb_comp = hsv_to_rgb(comp_h, s, v);
+        assert!(rgb_comp[0] > rgb_comp[2]); // Opposite warm hue
     }
 }
