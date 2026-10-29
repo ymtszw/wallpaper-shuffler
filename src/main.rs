@@ -467,7 +467,8 @@ fn handle_test_compose(args: &[String]) {
         }
     } else {
         println!(
-            "  -> Skipped: No images qualify for Single 4K mode (requires landscape width > height and width >= 3000px)."
+            "  -> Skipped: No images qualify for Single mode (requires landscape width > height and width >= {}px).",
+            composer::MIN_SINGLE_LANDSCAPE_WIDTH
         );
     }
 
@@ -543,7 +544,10 @@ fn handle_benchmark(args: &[String]) {
             avg_single, single_times
         );
     } else {
-        println!("Single 4K Fit:   skipped (no landscape images >= 3000px)");
+        println!(
+            "Single Fit:      skipped (no landscape images >= {}px)",
+            composer::MIN_SINGLE_LANDSCAPE_WIDTH
+        );
     }
 
     // Benchmark Collage

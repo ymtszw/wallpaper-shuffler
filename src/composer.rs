@@ -8,6 +8,7 @@ use std::time::Instant;
 
 pub const CANVAS_WIDTH_4K: u32 = 3840;
 pub const CANVAS_HEIGHT_4K: u32 = 2160;
+pub const MIN_SINGLE_LANDSCAPE_WIDTH: u32 = 1900;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositionMode {
@@ -50,7 +51,7 @@ impl RectI32 {
     }
 }
 
-/// Only landscape images (width > height) with horizontal resolution >= 3000px
+/// Only landscape images (width > height) with horizontal resolution >= 1900px (2K+)
 pub fn is_single_candidate(path: &Path) -> bool {
     let Ok(reader) = ImageReader::open(path) else {
         return false;
@@ -66,7 +67,7 @@ pub fn is_single_candidate(path: &Path) -> bool {
         return false; // Strictly landscape only, never vertical/square
     }
 
-    width >= 3000
+    width >= MIN_SINGLE_LANDSCAPE_WIDTH
 }
 
 pub fn load_rgb_image(path: &Path) -> Result<RgbImage, String> {
@@ -993,7 +994,10 @@ pub fn execute_mode_explicit(
                     .iter()
                     .find(|p| is_single_candidate(p))
                     .ok_or_else(|| {
-                        "No qualifying landscape 4K candidate (width > height and width >= 3000px) found in images".to_string()
+                        format!(
+                            "No qualifying landscape candidate (width > height and width >= {}px) found in images",
+                            MIN_SINGLE_LANDSCAPE_WIDTH
+                        )
                     })?
             };
             let img = compose_single(single_img)?;
@@ -1082,7 +1086,19 @@ mod tests {
         let res = compose_single(&portrait_path);
         assert!(res.is_err(), "compose_single must fail on portrait image");
 
+        // 2K landscape image (1920x1080) should qualify
+        let landscape_2k_path = temp_dir.join("test_2k_landscape.png");
+        let landscape_2k_img = RgbImage::from_pixel(1920, 1080, Rgb([100, 150, 200]));
+        landscape_2k_img.save(&landscape_2k_path).unwrap();
+        assert!(is_single_candidate(&landscape_2k_path));
+        let res_2k = compose_single(&landscape_2k_path);
+        assert!(
+            res_2k.is_ok(),
+            "compose_single must succeed on 2K landscape"
+        );
+
         // Clean up
         let _ = fs::remove_file(&portrait_path);
+        let _ = fs::remove_file(&landscape_2k_path);
     }
 }
