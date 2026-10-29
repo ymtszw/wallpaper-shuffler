@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetSystemMetrics, GetWindowLongW, GetWindowRect, IsIconic,
-    IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    WS_EX_TOOLWINDOW, WS_VISIBLE,
+    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetShellWindow, GetSystemMetrics,
+    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 use windows::core::BOOL;
 
@@ -53,6 +53,19 @@ pub fn get_virtual_screen_bounds() -> ScreenRect {
 
 pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
     unsafe {
+        if hwnd == GetShellWindow() {
+            return false;
+        }
+
+        let mut class_buf = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class_buf) as usize;
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_buf[..len]);
+            if class_name == "Progman" || class_name == "WorkerW" {
+                return false;
+            }
+        }
+
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
             return false;
         }
