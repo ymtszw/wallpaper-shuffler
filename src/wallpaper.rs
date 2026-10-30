@@ -1,5 +1,9 @@
 use std::path::Path;
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::UI::Shell::{DesktopWallpaper, IDesktopWallpaper};
 use windows::Win32::UI::WindowsAndMessaging::{
     SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SystemParametersInfoW,
 };
@@ -11,9 +15,29 @@ pub fn set_wallpaper(path: &Path) -> Result<(), String> {
 
     let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let path_str = abs_path.to_str().ok_or("Invalid UTF-8 path")?;
-    // Strip Windows extended path prefix "\\?\" as SystemParametersInfoW expects a standard path
+    // Strip Windows extended path prefix "\\?\"
     let clean_str = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
 
+    // 1. Try modern COM IDesktopWallpaper interface first (no broadcast stutter, smooth Explorer update)
+    if set_wallpaper_com(clean_str).is_ok() {
+        return Ok(());
+    }
+
+    // 2. Fallback to SystemParametersInfoW
+    set_wallpaper_fallback(clean_str)
+}
+
+fn set_wallpaper_com(clean_str: &str) -> windows::core::Result<()> {
+    unsafe {
+        let _com = ComGuard::new()?;
+        let wallpaper: IDesktopWallpaper = CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL)?;
+        let hstring = HSTRING::from(clean_str);
+        wallpaper.SetWallpaper(PCWSTR::null(), &hstring)?;
+        Ok(())
+    }
+}
+
+fn set_wallpaper_fallback(clean_str: &str) -> Result<(), String> {
     let mut wide: Vec<u16> = clean_str.encode_utf16().collect();
     wide.push(0);
 
