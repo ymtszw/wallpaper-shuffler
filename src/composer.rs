@@ -484,8 +484,8 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         return Err("Failed to load any valid images for collage".to_string());
     }
 
-    // Guarantee minimum 4 images for collage composition (cycle if fewer available)
-    while loaded.len() < 4 {
+    // Guarantee minimum 7 images for collage composition (5 primary + at least 2 underlay)
+    while loaded.len() < 7 {
         let clone_img = loaded[loaded.len() % loaded.len()].clone();
         loaded.push(clone_img);
     }
@@ -526,19 +526,12 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         })
         .collect();
 
-    // 1. Determine primary cards count (enforce minimum 4 images)
-    let primary_count = if prepared_cards.len() >= 5 && rng.gen_bool(0.4) {
-        5
+    // 1. Determine primary cards count (enforce 5+ images: 5 or 6)
+    let primary_count = if prepared_cards.len() >= 6 && rng.gen_bool(0.3) {
+        6
     } else {
-        4
+        5
     };
-
-    let anchors_4 = [
-        (880i32, 750i32),   // Top-Left
-        (2960i32, 750i32),  // Top-Right
-        (1100i32, 1450i32), // Bottom-Left
-        (2740i32, 1450i32), // Bottom-Right
-    ];
 
     let anchors_5 = [
         (800i32, 700i32),   // Top-Left
@@ -548,13 +541,22 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         (2880i32, 1500i32), // Bottom-Right
     ];
 
-    let primary_anchors: &[(i32, i32)] = if primary_count == 5 {
-        &anchors_5
+    let anchors_6 = [
+        (750i32, 650i32),   // Top-Left
+        (1920i32, 600i32),  // Top-Center
+        (3090i32, 650i32),  // Top-Right
+        (800i32, 1520i32),  // Bottom-Left
+        (1920i32, 1560i32), // Bottom-Center
+        (3040i32, 1520i32), // Bottom-Right
+    ];
+
+    let primary_anchors: &[(i32, i32)] = if primary_count == 6 {
+        &anchors_6
     } else {
-        &anchors_4
+        &anchors_5
     };
 
-    // 2. Exploratory optimization round for primary 4+ cards:
+    // 2. Exploratory optimization round for primary 5+ cards:
     // Minimize mutual overlap (all cards >= 70% visible) while minimizing canvas background margin.
     let min_exposure_threshold = 0.70f32;
     let mut best_primary_placements = Vec::new();
@@ -609,75 +611,85 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
 
     if best_primary_placements.is_empty() {
         best_primary_placements = best_fallback_placements;
-        best_margin_ratio = calculate_canvas_margin_ratio(&best_primary_placements, 40, 24);
     }
 
-    // 3. Exception Rule: Underlay Gap-Filling Round
-    // If canvas background margin remains above ~20% (0.20), pick additional images
-    // and place them underneath the primary cards to cover the margin, requiring >= 10% visible exposure.
+    // 3. Exception Rule: Underlay Gap-Filling Round (Fixed minimum 2 underlays)
+    // Place additional images underneath the primary cards to cover the remaining margins,
+    // requiring >= 10% visible exposure.
     struct UnderlayCard {
         card_idx: usize,
         placement: CollageCardPlacement,
     }
 
     let mut underlay_cards: Vec<UnderlayCard> = Vec::new();
+    let mut all_current_placements = best_primary_placements.clone();
+    let max_extra = prepared_cards.len().min(primary_count + 4);
 
-    if best_margin_ratio > 0.19 && prepared_cards.len() > primary_count {
-        let mut all_current_placements = best_primary_placements.clone();
-        let max_extra = prepared_cards.len().min(primary_count + 3);
+    for (extra_idx, prep) in prepared_cards
+        .iter()
+        .enumerate()
+        .take(max_extra)
+        .skip(primary_count)
+    {
+        let uncovered_points = collect_uncovered_grid_points(&all_current_placements, 40, 24);
+        let current_margin = uncovered_points.len() as f32 / (40.0 * 24.0);
 
-        for (extra_idx, prep) in prepared_cards
-            .iter()
-            .enumerate()
-            .take(max_extra)
-            .skip(primary_count)
-        {
-            let uncovered_points = collect_uncovered_grid_points(&all_current_placements, 40, 24);
-            let current_margin = uncovered_points.len() as f32 / (40.0 * 24.0);
-            if current_margin <= 0.16 || uncovered_points.is_empty() {
-                break;
-            }
+        // After satisfying the minimum 2 underlay cards, stop if margin is sufficiently low
+        if underlay_cards.len() >= 2 && (current_margin <= 0.15 || uncovered_points.is_empty()) {
+            break;
+        }
 
-            let mut best_cand: Option<CollageCardPlacement> = None;
-            let mut best_covered_new = 0usize;
+        let mut best_cand: Option<CollageCardPlacement> = None;
+        let mut best_score = -1.0f32;
 
-            // Search best underlay position across clusters of uncovered points
-            for _ in 0..50 {
-                let &(target_x, target_y) = uncovered_points.choose(&mut rng).unwrap();
-                let cx = target_x + rng.gen_range(-90.0..=90.0);
-                let cy = target_y + rng.gen_range(-90.0..=90.0);
-                let angle_deg = rng.gen_range(-8.0..=8.0);
-                let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
+        // Search best underlay position across clusters of uncovered points
+        for _ in 0..60 {
+            let (target_x, target_y) = if let Some(&(tx, ty)) = uncovered_points.choose(&mut rng) {
+                (tx, ty)
+            } else {
+                let border_anchors = [
+                    (1920.0, 450.0),
+                    (1920.0, 1700.0),
+                    (500.0, 1100.0),
+                    (3340.0, 1100.0),
+                ];
+                *border_anchors.choose(&mut rng).unwrap()
+            };
 
-                let cand = CollageCardPlacement {
-                    cx,
-                    cy,
-                    w: prep.w,
-                    h: prep.h,
-                    angle_rad,
-                };
+            let cx = target_x + rng.gen_range(-100.0..=100.0);
+            let cy = target_y + rng.gen_range(-100.0..=100.0);
+            let angle_deg = rng.gen_range(-8.5..=8.5);
+            let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
 
-                // Requirement: underlay card must peek out with at least 10% visible area underneath primary cards
-                let visible_ratio = cand.calculate_unoccluded_ratio(&best_primary_placements);
-                if visible_ratio >= 0.10 {
-                    let newly_covered = uncovered_points
-                        .iter()
-                        .filter(|(px, py)| cand.contains_point(*px, *py))
-                        .count();
-                    if newly_covered > best_covered_new {
-                        best_covered_new = newly_covered;
-                        best_cand = Some(cand);
-                    }
+            let cand = CollageCardPlacement {
+                cx,
+                cy,
+                w: prep.w,
+                h: prep.h,
+                angle_rad,
+            };
+
+            // Requirement: underlay card must peek out with at least 10% visible area underneath primary cards
+            let visible_ratio = cand.calculate_unoccluded_ratio(&best_primary_placements);
+            if visible_ratio >= 0.10 {
+                let newly_covered = uncovered_points
+                    .iter()
+                    .filter(|(px, py)| cand.contains_point(*px, *py))
+                    .count();
+                let score = newly_covered as f32 * 10.0 + visible_ratio;
+                if score > best_score {
+                    best_score = score;
+                    best_cand = Some(cand);
                 }
             }
+        }
 
-            if let Some(winning_cand) = best_cand.filter(|_| best_covered_new >= 12) {
-                all_current_placements.push(winning_cand.clone());
-                underlay_cards.push(UnderlayCard {
-                    card_idx: extra_idx,
-                    placement: winning_cand,
-                });
-            }
+        if let Some(winning_cand) = best_cand {
+            all_current_placements.push(winning_cand.clone());
+            underlay_cards.push(UnderlayCard {
+                card_idx: extra_idx,
+                placement: winning_cand,
+            });
         }
     }
 
@@ -748,15 +760,24 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     // Bold, noticeable gap (30px) to prevent cramped edges and eliminate lopsided feeling
     let bold_gap = 30i32;
 
-    // 1. Center hero tile from the shuffled pool (usually portrait)
+    // 1. Lower-center anchor tile with jitter (bleeds over bottom allowed)
+    // Starting in the lower-center distributes space upwards so upper tiles don't get truncated
     let first_src = &loaded[0];
     let first_max = rng.gen_range(1200..=1400);
     let first_scaled = fit_downscale_only(first_src, first_max);
     let fw = first_scaled.width() as i32;
     let fh = first_scaled.height() as i32;
+
+    let base_start_x = canvas_cx;
+    let base_start_y = 1550i32; // Lower-center baseline
+    let jitter_x = rng.gen_range(-280..=280);
+    let jitter_y = rng.gen_range(-160..=160);
+    let start_x = base_start_x + jitter_x;
+    let start_y = base_start_y + jitter_y;
+
     let first_rect = RectI32 {
-        x: canvas_cx - fw / 2,
-        y: canvas_cy - fh / 2,
+        x: start_x - fw / 2,
+        y: start_y - fh / 2,
         w: fw,
         h: fh,
     };
