@@ -10,6 +10,12 @@ pub struct AppConfig {
     pub cooldown_seconds: u64,
     pub debounce_millis: u64,
     pub history_count: usize,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl Default for AppConfig {
@@ -21,6 +27,7 @@ impl Default for AppConfig {
             cooldown_seconds: 300,
             debounce_millis: 400,
             history_count: 10,
+            log_level: default_log_level(),
         }
     }
 }

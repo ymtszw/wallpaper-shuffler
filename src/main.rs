@@ -25,13 +25,65 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
+    Off = 4,
+}
+
+impl LogLevel {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "debug" => LogLevel::Debug,
+            "warn" | "warning" => LogLevel::Warn,
+            "error" => LogLevel::Error,
+            "off" | "none" => LogLevel::Off,
+            _ => LogLevel::Info,
+        }
+    }
+}
+
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(400);
 static FOREGROUND_LOGGING: AtomicBool = AtomicBool::new(false);
+static CURRENT_LOG_LEVEL: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(LogLevel::Info as u8);
 static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
 static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
     std::sync::Mutex::new(None);
 static WAS_DESKTOP_OBSCURED: AtomicBool = AtomicBool::new(true);
+
+fn should_log(level: LogLevel) -> bool {
+    FOREGROUND_LOGGING.load(Ordering::Relaxed)
+        && CURRENT_LOG_LEVEL.load(Ordering::Relaxed) <= (level as u8)
+}
+
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        if should_log(LogLevel::Debug) {
+            println!($($arg)*);
+        }
+    };
+}
+
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        if should_log(LogLevel::Info) {
+            println!($($arg)*);
+        }
+    };
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        if should_log(LogLevel::Error) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
 const TIMER_WATCH_ID: usize = 9002;
@@ -44,12 +96,10 @@ fn on_window_activity_detected(source: &str) {
         return;
     }
 
-    if FOREGROUND_LOGGING.load(Ordering::Relaxed) {
-        println!(
-            "[{}] Window movement/resize/minimize detected! Pre-composing next wallpaper...",
-            source
-        );
-    }
+    log_debug!(
+        "[{}] Window movement/resize/minimize detected! Pre-composing next wallpaper...",
+        source
+    );
 
     let debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed) as u32;
     unsafe {
@@ -62,7 +112,7 @@ fn on_window_activity_detected(source: &str) {
     }
 
     let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
-    ensure_candidate_precomposed_async(&cfg, FOREGROUND_LOGGING.load(Ordering::Relaxed));
+    ensure_candidate_precomposed_async(&cfg);
 }
 
 fn check_window_watch() {
@@ -95,16 +145,14 @@ fn get_history_dir() -> PathBuf {
 
 /// Speculatively pre-composes the next wallpaper candidate in a background thread
 /// as soon as window activity is detected, caching it in STANDBY_WALLPAPER.
-fn ensure_candidate_precomposed_async(cfg: &config::AppConfig, log: bool) {
+fn ensure_candidate_precomposed_async(cfg: &config::AppConfig) {
     // 1. Check if an unconsumed standby candidate is already ready
     {
         let guard = STANDBY_WALLPAPER.lock().unwrap();
         if guard.is_some() {
-            if log {
-                println!(
-                    "[STANDBY CACHE] Ready candidate already standby. Skipping duplicate composition."
-                );
-            }
+            log_debug!(
+                "[STANDBY CACHE] Ready candidate already standby. Skipping duplicate composition."
+            );
             return;
         }
     }
@@ -121,33 +169,25 @@ fn ensure_candidate_precomposed_async(cfg: &config::AppConfig, log: bool) {
     let history_count = cfg.history_count;
     let history_dir = get_history_dir();
 
-    if log {
-        println!(
-            ">>> [SPECULATIVE PRECOMP] Window activity detected. Generating next wallpaper candidate in background thread..."
-        );
-    }
+    log_debug!(
+        ">>> [SPECULATIVE PRECOMP] Window activity detected. Generating next wallpaper candidate in background thread..."
+    );
 
     std::thread::spawn(move || {
         let res =
             composer::execute_shuffle_and_compose(&wallpaper_dirs, &history_dir, history_count);
         match res {
             Ok(comp_res) => {
-                let log = FOREGROUND_LOGGING.load(Ordering::Relaxed);
-                if log {
-                    println!(
-                        "[PRECOMP READY] Next candidate ({:?}) prepared in {}ms! Stored in standby cache: {}",
-                        comp_res.mode,
-                        comp_res.duration_ms,
-                        comp_res.output_path.display()
-                    );
-                }
+                log_debug!(
+                    "[PRECOMP READY] Next candidate ({:?}) prepared in {}ms! Stored in standby cache: {}",
+                    comp_res.mode,
+                    comp_res.duration_ms,
+                    comp_res.output_path.display()
+                );
                 *STANDBY_WALLPAPER.lock().unwrap() = Some(comp_res);
             }
             Err(e) => {
-                let log = FOREGROUND_LOGGING.load(Ordering::Relaxed);
-                if log {
-                    eprintln!("[PRECOMP ERROR] Background composition failed: {}", e);
-                }
+                log_error!("[PRECOMP ERROR] Background composition failed: {}", e);
             }
         }
         IS_COMPOSING.store(false, Ordering::SeqCst);
@@ -224,15 +264,12 @@ unsafe extern "system" fn window_proc(
         }
         WM_POWERBROADCAST => {
             if wparam.0 == PBT_APMRESUMEAUTOMATIC || wparam.0 == PBT_APMRESUMESUSPEND {
-                let is_fg = FOREGROUND_LOGGING.load(Ordering::Relaxed);
-                if is_fg {
-                    println!(
-                        ">>> [POWER RESUME] System resumed from sleep/suspend. Triggering wallpaper shuffle..."
-                    );
-                }
+                log_info!(
+                    ">>> [POWER RESUME] System resumed from sleep/suspend. Triggering wallpaper shuffle..."
+                );
                 WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
                 let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
-                apply_or_await_wallpaper(&cfg, is_fg);
+                apply_or_await_wallpaper(&cfg);
             }
         }
         tray::WM_TRAYICON => {
@@ -280,31 +317,27 @@ fn on_debounce_settled() {
     // 1. If desktop is obscured (< 5.0%), arm the transition state
     if current_exposure < cfg.obscured_threshold_percent {
         WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
-        if is_foreground {
-            println!(
-                "[DESKTOP COVERED] Windows: {} | Exposure: {:.1}% (< {:.1}% threshold). Armed for next reveal!",
-                visible_windows.len(),
-                current_exposure,
-                cfg.obscured_threshold_percent
-            );
-        }
+        log_debug!(
+            "[DESKTOP COVERED] Windows: {} | Exposure: {:.1}% (< {:.1}% threshold). Armed for next reveal!",
+            visible_windows.len(),
+            current_exposure,
+            cfg.obscured_threshold_percent
+        );
         return;
     }
 
     // 2. If desktop is exposed (>= 15.0%)
     if current_exposure >= cfg.exposed_threshold_percent {
         let was_obscured = WAS_DESKTOP_OBSCURED.load(Ordering::SeqCst);
-        if is_foreground {
-            println!(
-                "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%, Armed: {})",
-                visible_windows.len(),
-                current_exposure,
-                prev_exposure,
-                cfg.obscured_threshold_percent,
-                cfg.exposed_threshold_percent,
-                was_obscured
-            );
-        }
+        log_debug!(
+            "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%, Armed: {})",
+            visible_windows.len(),
+            current_exposure,
+            prev_exposure,
+            cfg.obscured_threshold_percent,
+            cfg.exposed_threshold_percent,
+            was_obscured
+        );
 
         if was_obscured {
             let last_time = *LAST_SHUFFLE_TIME.lock().unwrap();
@@ -315,28 +348,29 @@ fn on_debounce_settled() {
             };
 
             if detector::has_cooldown_elapsed(last_time, effective_cooldown) {
-                if is_foreground {
-                    println!(
-                        ">>> [TRIGGER: REVEAL] Desktop transitioned from covered to exposed ({:.1}% >= {:.1}%)! Applying wallpaper...",
-                        current_exposure, cfg.exposed_threshold_percent
-                    );
-                }
-                apply_or_await_wallpaper(&cfg, is_foreground);
+                log_info!(
+                    ">>> [TRIGGER: REVEAL] Desktop transitioned from covered to exposed ({:.1}% >= {:.1}%)! Applying wallpaper...",
+                    current_exposure,
+                    cfg.exposed_threshold_percent
+                );
+                apply_or_await_wallpaper(&cfg);
                 WAS_DESKTOP_OBSCURED.store(false, Ordering::SeqCst);
-            } else if is_foreground {
-                println!(
+            } else {
+                log_debug!(
                     "[COOLDOWN] Window settled & desktop exposed, but cooldown ({}s) has not elapsed yet. Standby candidate preserved.",
                     effective_cooldown
                 );
             }
-        } else if is_foreground {
-            println!(
+        } else {
+            log_debug!(
                 "[EXPOSED (NO TRIGGER)] Desktop remains exposed ({:.1}% >= {:.1}%). Skipping shuffle (waiting for desktop to be covered < {:.1}% first).",
-                current_exposure, cfg.exposed_threshold_percent, cfg.obscured_threshold_percent
+                current_exposure,
+                cfg.exposed_threshold_percent,
+                cfg.obscured_threshold_percent
             );
         }
-    } else if is_foreground {
-        println!(
+    } else {
+        log_debug!(
             "[INTERMEDIATE] Windows: {} | Exposure: {:.1}% (Between {:.1}% and {:.1}%). No state transition.",
             visible_windows.len(),
             current_exposure,
@@ -348,24 +382,19 @@ fn on_debounce_settled() {
 
 fn trigger_manual_shuffle() {
     let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
-    let is_foreground = FOREGROUND_LOGGING.load(Ordering::Relaxed);
-    if is_foreground {
-        println!(">>> [MANUAL TRIGGER] Shuffle requested from tray or CLI.");
-    }
-    apply_or_await_wallpaper(&cfg, is_foreground);
+    log_info!(">>> [MANUAL TRIGGER] Shuffle requested from tray or CLI.");
+    apply_or_await_wallpaper(&cfg);
 }
 
-fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
+fn apply_or_await_wallpaper(cfg: &config::AppConfig) {
     // 1. Take candidate from standby cache if ready
     let mut candidate = STANDBY_WALLPAPER.lock().unwrap().take();
 
     // 2. If background pre-composition is still running, wait for completion (up to 2000ms)
     if candidate.is_none() && IS_COMPOSING.load(Ordering::SeqCst) {
-        if log {
-            println!(
-                "[AWAIT PRECOMP] Background composition in progress. Awaiting completion for instant application..."
-            );
-        }
+        log_debug!(
+            "[AWAIT PRECOMP] Background composition in progress. Awaiting completion for instant application..."
+        );
         let start = Instant::now();
         while start.elapsed().as_millis() < 2000 {
             std::thread::sleep(std::time::Duration::from_millis(40));
@@ -382,19 +411,15 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
     // 3. Fallback: synchronously compose if standby was empty
     let candidate = match candidate {
         Some(c) => {
-            if log {
-                println!(
-                    "[STANDBY HIT] Applying pre-composed {:?} wallpaper with ZERO wait time! ({})",
-                    c.mode,
-                    c.output_path.display()
-                );
-            }
+            log_debug!(
+                "[STANDBY HIT] Applying pre-composed {:?} wallpaper with ZERO wait time! ({})",
+                c.mode,
+                c.output_path.display()
+            );
             c
         }
         None => {
-            if log {
-                println!("[SYNC FALLBACK] No standby image ready, synthesizing synchronously...");
-            }
+            log_info!("[SYNC FALLBACK] No standby image ready, synthesizing synchronously...");
             let history_dir = get_history_dir();
             match composer::execute_shuffle_and_compose(
                 &cfg.wallpaper_dirs,
@@ -403,9 +428,7 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
             ) {
                 Ok(c) => c,
                 Err(e) => {
-                    if log {
-                        eprintln!("[ERROR] Fallback composition failed: {}", e);
-                    }
+                    log_error!("[ERROR] Fallback composition failed: {}", e);
                     return;
                 }
             }
@@ -413,19 +436,15 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
     };
 
     if let Err(e) = wallpaper::set_wallpaper(&candidate.output_path) {
-        if log {
-            eprintln!("[ERROR] Failed to set wallpaper: {}", e);
-        }
+        log_error!("[ERROR] Failed to set wallpaper: {}", e);
     } else {
-        if log {
-            println!(
-                "[WALLPAPER APPLIED] Successfully updated Windows wallpaper! (Used {} images)",
-                candidate.source_images.len()
-            );
-        }
+        log_info!(
+            "[WALLPAPER APPLIED] Successfully updated Windows wallpaper! (Used {} images)",
+            candidate.source_images.len()
+        );
         *LAST_SHUFFLE_TIME.lock().unwrap() = Some(chrono::Utc::now());
         // Speculatively pre-compose the next candidate in advance so future reveals are instant
-        ensure_candidate_precomposed_async(cfg, log);
+        ensure_candidate_precomposed_async(cfg);
     }
 }
 
@@ -439,17 +458,11 @@ fn get_config_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("config.json"))
 }
 
-fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
-    if foreground {
-        attach_parent_console();
-        FOREGROUND_LOGGING.store(true, Ordering::SeqCst);
-        println!("=== wallpaper-shuffler foreground daemon started ===");
-        println!(
-            "Listening for window movements, minimizes (Win+D), and desktop exposure changes..."
-        );
-        println!("Press Ctrl+C to stop.\n");
-    }
-
+fn run_daemon(
+    foreground: bool,
+    override_dir: Option<PathBuf>,
+    log_level_override: Option<LogLevel>,
+) {
     let config_path = get_config_path();
     let mut cfg = config::AppConfig::load_from_file(&config_path).unwrap_or_else(|_| {
         let default_cfg = config::AppConfig::default();
@@ -461,7 +474,18 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
         cfg.wallpaper_dirs = vec![custom_dir];
     }
 
+    let active_log_level = log_level_override.unwrap_or_else(|| LogLevel::parse(&cfg.log_level));
+    CURRENT_LOG_LEVEL.store(active_log_level as u8, Ordering::SeqCst);
+
     if foreground {
+        attach_parent_console();
+        FOREGROUND_LOGGING.store(true, Ordering::SeqCst);
+        println!("=== wallpaper-shuffler foreground daemon started ===");
+        println!(
+            "Listening for window movements, minimizes (Win+D), and desktop exposure changes..."
+        );
+        println!("Press Ctrl+C to stop.\n");
+
         println!("Configuration:");
         println!("  Source directories: {:?}", cfg.wallpaper_dirs);
         println!("  History directory:  {}", get_history_dir().display());
@@ -470,14 +494,15 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
             cfg.obscured_threshold_percent, cfg.exposed_threshold_percent
         );
         println!("  Cooldown:           {} seconds", cfg.cooldown_seconds);
-        println!("  Debounce:           {} ms\n", cfg.debounce_millis);
+        println!("  Debounce:           {} ms", cfg.debounce_millis);
+        println!("  Log level:          {:?}\n", active_log_level);
     }
 
     LAST_DEBOUNCE_MS.store(cfg.debounce_millis, Ordering::SeqCst);
     *APP_CONFIG.lock().unwrap() = Some(cfg.clone());
 
     // Pre-compose 1 standby wallpaper immediately on daemon startup so the very first trigger is instant (0ms latency)
-    ensure_candidate_precomposed_async(&cfg, foreground);
+    ensure_candidate_precomposed_async(&cfg);
 
     unsafe {
         let instance = GetModuleHandleW(None).unwrap_or_default();
@@ -507,7 +532,7 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
         );
 
         if hwnd.is_err() {
-            eprintln!("Failed to create message window");
+            log_error!("Failed to create message window");
             return;
         }
         let hwnd = hwnd.unwrap();
@@ -522,39 +547,36 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
         let visible_windows = detector::collect_visible_window_rects();
         let initial_exposure = detector::calculate_desktop_exposure_rate();
         *PREVIOUS_EXPOSURE.lock().unwrap() = Some(initial_exposure);
-        if foreground {
-            println!(
-                "[INITIAL] Recognized {} visible window(s). Desktop exposure rate: {:.1}%",
-                visible_windows.len(),
-                initial_exposure
+
+        log_info!(
+            "[INITIAL] Recognized {} visible window(s). Desktop exposure rate: {:.1}%",
+            visible_windows.len(),
+            initial_exposure
+        );
+        if _hook_guard.is_none() {
+            log_error!("[ERROR] Failed to install SetWinEventHook! Check privileges.");
+        } else {
+            log_info!(
+                "[READY] SetWinEventHook active (monitoring move, resize, minimize, foreground)."
             );
-            if _hook_guard.is_none() {
-                eprintln!("[ERROR] Failed to install SetWinEventHook! Check privileges.");
-            } else {
-                println!(
-                    "[READY] SetWinEventHook active (monitoring move, resize, minimize, foreground)."
-                );
-            }
         }
 
         // Startup trigger: if desktop is visible on startup/launch, apply initial wallpaper immediately
         if initial_exposure >= cfg.exposed_threshold_percent {
-            if foreground {
-                println!(
-                    ">>> [STARTUP TRIGGER] Desktop is visible ({:.1}% >= {:.1}%). Applying initial wallpaper...",
-                    initial_exposure, cfg.exposed_threshold_percent
-                );
-            }
-            apply_or_await_wallpaper(&cfg, foreground);
+            log_info!(
+                ">>> [STARTUP TRIGGER] Desktop is visible ({:.1}% >= {:.1}%). Applying initial wallpaper...",
+                initial_exposure,
+                cfg.exposed_threshold_percent
+            );
+            apply_or_await_wallpaper(&cfg);
             WAS_DESKTOP_OBSCURED.store(false, Ordering::SeqCst);
         } else {
             WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
-            if foreground {
-                println!(
-                    "[STARTUP ARMED] Desktop is currently covered ({:.1}% < {:.1}%). Armed for first reveal.",
-                    initial_exposure, cfg.exposed_threshold_percent
-                );
-            }
+            log_info!(
+                "[STARTUP ARMED] Desktop is currently covered ({:.1}% < {:.1}%). Armed for first reveal.",
+                initial_exposure,
+                cfg.exposed_threshold_percent
+            );
         }
 
         let mut msg = MSG::default();
@@ -588,7 +610,10 @@ fn print_help() {
     );
     println!("Resident Daemon & System Commands:");
     println!(
-        "  --run-foreground [DIR]              Run daemon in console with real-time logs (optional: override wallpaper DIR)"
+        "  --run-foreground [DIR] [--debug]    Run daemon in console with logs (default: info, --debug: verbose)"
+    );
+    println!(
+        "  --log-level <debug|info|warn|error> Set log verbosity level (can also be configured in config.json)"
     );
     println!(
         "  --register-startup                  Register application to start automatically on Windows boot"
@@ -910,12 +935,28 @@ fn main() {
                 return;
             }
             "--run-foreground" => {
-                let override_dir = if args.len() > 2 {
-                    Some(PathBuf::from(&args[2]))
-                } else {
-                    None
-                };
-                run_daemon(true, override_dir);
+                let mut override_dir = None;
+                let mut override_log_level = None;
+                let mut i = 2;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--debug" => {
+                            override_log_level = Some(LogLevel::Debug);
+                        }
+                        "--log-level" => {
+                            if i + 1 < args.len() {
+                                i += 1;
+                                override_log_level = Some(LogLevel::parse(&args[i]));
+                            }
+                        }
+                        other if !other.starts_with("--") && override_dir.is_none() => {
+                            override_dir = Some(PathBuf::from(other));
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                run_daemon(true, override_dir, override_log_level);
                 return;
             }
             "--register-startup" => {
@@ -953,5 +994,5 @@ fn main() {
         }
     }
 
-    run_daemon(false, None);
+    run_daemon(false, None, None);
 }
