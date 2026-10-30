@@ -6,10 +6,12 @@ mod config;
 mod detector;
 mod fixtures;
 mod hook;
+mod logger;
 mod startup;
 mod tray;
 mod wallpaper;
 
+use logger::LogLevel;
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -25,65 +27,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LogLevel {
-    Debug = 0,
-    Info = 1,
-    Warn = 2,
-    Error = 3,
-    Off = 4,
-}
-
-impl LogLevel {
-    pub fn parse(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "debug" => LogLevel::Debug,
-            "warn" | "warning" => LogLevel::Warn,
-            "error" => LogLevel::Error,
-            "off" | "none" => LogLevel::Off,
-            _ => LogLevel::Info,
-        }
-    }
-}
-
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(400);
-static FOREGROUND_LOGGING: AtomicBool = AtomicBool::new(false);
-static CURRENT_LOG_LEVEL: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(LogLevel::Info as u8);
 static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
 static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
     std::sync::Mutex::new(None);
 static WAS_DESKTOP_OBSCURED: AtomicBool = AtomicBool::new(true);
-
-fn should_log(level: LogLevel) -> bool {
-    FOREGROUND_LOGGING.load(Ordering::Relaxed)
-        && CURRENT_LOG_LEVEL.load(Ordering::Relaxed) <= (level as u8)
-}
-
-macro_rules! log_debug {
-    ($($arg:tt)*) => {
-        if should_log(LogLevel::Debug) {
-            println!($($arg)*);
-        }
-    };
-}
-
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        if should_log(LogLevel::Info) {
-            println!($($arg)*);
-        }
-    };
-}
-
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        if should_log(LogLevel::Error) {
-            eprintln!($($arg)*);
-        }
-    };
-}
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
 const TIMER_WATCH_ID: usize = 9002;
@@ -304,7 +253,7 @@ static APP_CONFIG: std::sync::Mutex<Option<config::AppConfig>> = std::sync::Mute
 fn on_debounce_settled() {
     let visible_windows = detector::collect_visible_window_rects();
     let current_exposure = detector::calculate_desktop_exposure_rate();
-    let is_foreground = FOREGROUND_LOGGING.load(Ordering::Relaxed);
+    let is_foreground = logger::is_foreground();
 
     let mut prev_guard = PREVIOUS_EXPOSURE.lock().unwrap();
     let prev_exposure = prev_guard.unwrap_or(current_exposure);
@@ -480,11 +429,10 @@ fn run_daemon(
     }
 
     let active_log_level = log_level_override.unwrap_or_else(|| LogLevel::parse(&cfg.log_level));
-    CURRENT_LOG_LEVEL.store(active_log_level as u8, Ordering::SeqCst);
+    logger::init(foreground, active_log_level);
 
     if foreground {
         attach_parent_console();
-        FOREGROUND_LOGGING.store(true, Ordering::SeqCst);
         println!("=== wallpaper-shuffler foreground daemon started ===");
         println!(
             "Listening for window movements, minimizes (Win+D), and desktop exposure changes..."
@@ -495,12 +443,25 @@ fn run_daemon(
         println!("  Source directories: {:?}", cfg.wallpaper_dirs);
         println!("  History directory:  {}", get_history_dir().display());
         println!(
+            "  Log directory:      {}",
+            logger::default_log_dir().display()
+        );
+        println!(
             "  Thresholds:         hidden < {:.1}%, exposed >= {:.1}%",
             cfg.obscured_threshold_percent, cfg.exposed_threshold_percent
         );
         println!("  Cooldown:           {} seconds", cfg.cooldown_seconds);
         println!("  Debounce:           {} ms", cfg.debounce_millis);
         println!("  Log level:          {:?}\n", active_log_level);
+    } else {
+        log_info!("=== wallpaper-shuffler background daemon started ===");
+        log_info!("Log level: {:?}", active_log_level);
+        log_info!("Source directories: {:?}", cfg.wallpaper_dirs);
+        log_info!("History directory:  {}", get_history_dir().display());
+        log_info!(
+            "Log directory:      {}",
+            logger::default_log_dir().display()
+        );
     }
 
     LAST_DEBOUNCE_MS.store(cfg.debounce_millis, Ordering::SeqCst);

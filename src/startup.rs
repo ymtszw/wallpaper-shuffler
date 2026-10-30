@@ -8,6 +8,8 @@ use windows::Win32::System::Registry::{
 use windows::core::{PCWSTR, w};
 
 const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const STARTUP_APPROVED_SUBKEY: PCWSTR =
+    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
 const APP_REG_NAME: PCWSTR = w!("WallpaperShuffler");
 
 fn str_to_u16_vec(s: &OsStr) -> Vec<u16> {
@@ -44,7 +46,13 @@ pub fn register_startup(exe_path: &OsStr) -> Result<(), String> {
             return Err(format!("Failed to open registry key: {:?}", open_res));
         }
 
-        let wide_path = str_to_u16_vec(exe_path);
+        let path_str = exe_path.to_string_lossy();
+        let quoted = if path_str.starts_with('"') && path_str.ends_with('"') {
+            path_str.to_string()
+        } else {
+            format!("\"{}\"", path_str)
+        };
+        let wide_path = str_to_u16_vec(OsStr::new(&quoted));
         let byte_slice = std::slice::from_raw_parts(
             wide_path.as_ptr() as *const u8,
             wide_path.len() * std::mem::size_of::<u16>(),
@@ -55,6 +63,20 @@ pub fn register_startup(exe_path: &OsStr) -> Result<(), String> {
 
         if set_res != ERROR_SUCCESS {
             return Err(format!("Failed to set registry value: {:?}", set_res));
+        }
+
+        // Also clean up any disabled state in StartupApproved so Windows recognizes it as active
+        let mut approved_key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            STARTUP_APPROVED_SUBKEY,
+            Some(0),
+            KEY_WRITE,
+            &mut approved_key,
+        ) == ERROR_SUCCESS
+        {
+            let _ = RegDeleteValueW(approved_key, APP_REG_NAME);
+            let _ = RegCloseKey(approved_key);
         }
 
         Ok(())
@@ -80,6 +102,19 @@ pub fn unregister_startup() -> Result<(), String> {
 
         if del_res != ERROR_SUCCESS && del_res != ERROR_FILE_NOT_FOUND {
             return Err(format!("Failed to delete registry value: {:?}", del_res));
+        }
+
+        let mut approved_key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            STARTUP_APPROVED_SUBKEY,
+            Some(0),
+            KEY_WRITE,
+            &mut approved_key,
+        ) == ERROR_SUCCESS
+        {
+            let _ = RegDeleteValueW(approved_key, APP_REG_NAME);
+            let _ = RegCloseKey(approved_key);
         }
 
         Ok(())
