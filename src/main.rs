@@ -30,6 +30,7 @@ use windows::core::w;
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(400);
 static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
+static IS_PAUSED: AtomicBool = AtomicBool::new(false);
 static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
     std::sync::Mutex::new(None);
 static WAS_DESKTOP_OBSCURED: AtomicBool = AtomicBool::new(true);
@@ -40,6 +41,10 @@ const TIMER_WATCH_ID: usize = 9002;
 static LAST_WATCH_STATE: std::sync::Mutex<Option<(usize, f64)>> = std::sync::Mutex::new(None);
 
 fn on_window_activity_detected(source: &str) {
+    if IS_PAUSED.load(Ordering::Relaxed) {
+        return;
+    }
+
     let target = TARGET_HWND.load(Ordering::Relaxed);
     if target == 0 {
         return;
@@ -222,13 +227,83 @@ unsafe extern "system" fn window_proc(
         tray::WM_TRAYICON => {
             let event = (lparam.0 as usize & 0xFFFF) as u32;
             if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
-                tray::show_tray_context_menu(hwnd);
+                let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+                let is_paused = IS_PAUSED.load(Ordering::Relaxed);
+                let log_level = logger::get_log_level();
+                tray::show_tray_context_menu(hwnd, &cfg, is_paused, log_level);
             }
         }
         WM_COMMAND => match wparam.0 {
             tray::IDM_SHUFFLE_NOW => {
                 trigger_manual_shuffle();
             }
+            tray::IDM_TOGGLE_PAUSE => {
+                let prev = IS_PAUSED.fetch_xor(true, Ordering::SeqCst);
+                let now_paused = !prev;
+                if now_paused {
+                    log_info!("Auto-shuffle paused by user via tray menu.");
+                    tray::update_tray_tooltip("Wallpaper Shuffler (Paused)");
+                } else {
+                    log_info!("Auto-shuffle resumed by user via tray menu.");
+                    tray::update_tray_tooltip("Wallpaper Shuffler");
+                }
+            }
+            tray::IDM_SETTINGS_INFO => {
+                let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+                let config_path = get_config_path();
+                tray::show_settings_dialog(hwnd, &cfg, &config_path);
+            }
+            tray::IDM_OPEN_CONFIG => {
+                let config_path = get_config_path();
+                tray::open_path_with_shell(hwnd, &config_path);
+            }
+            tray::IDM_RELOAD_CONFIG => {
+                let config_path = get_config_path();
+                match config::AppConfig::load_from_file(&config_path) {
+                    Ok(new_cfg) => {
+                        let new_log_level = LogLevel::parse(&new_cfg.log_level);
+                        logger::set_log_level(new_log_level);
+                        LAST_DEBOUNCE_MS.store(new_cfg.debounce_millis, Ordering::SeqCst);
+                        *APP_CONFIG.lock().unwrap() = Some(new_cfg.clone());
+                        log_info!(
+                            "Configuration reloaded from {}: {:?}",
+                            config_path.display(),
+                            new_cfg
+                        );
+                    }
+                    Err(e) => {
+                        log_error!("Failed to reload config: {}", e);
+                    }
+                }
+            }
+            tray::IDM_OPEN_WALLPAPERS | tray::IDM_STATUS_FOLDER => {
+                let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+                if let Some(folder) = cfg.wallpaper_dirs.first() {
+                    tray::open_path_with_shell(hwnd, folder);
+                }
+            }
+            tray::IDM_OPEN_LOGS => {
+                let log_dir = logger::default_log_dir();
+                tray::open_path_with_shell(hwnd, &log_dir);
+            }
+            tray::IDM_TOGGLE_STARTUP => {
+                if startup::is_startup_enabled() {
+                    match startup::unregister_startup() {
+                        Ok(()) => log_info!("Windows startup disabled via tray menu."),
+                        Err(e) => log_error!("Failed to unregister startup: {}", e),
+                    }
+                } else if let Ok(exe_path) = env::current_exe() {
+                    match startup::register_startup(exe_path.as_os_str()) {
+                        Ok(()) => log_info!("Windows startup enabled via tray menu."),
+                        Err(e) => log_error!("Failed to register startup: {}", e),
+                    }
+                }
+            }
+            tray::IDM_LOG_DEBUG => update_active_log_level(LogLevel::Debug),
+            tray::IDM_LOG_INFO => update_active_log_level(LogLevel::Info),
+            tray::IDM_LOG_WARN => update_active_log_level(LogLevel::Warn),
+            tray::IDM_LOG_ERROR => update_active_log_level(LogLevel::Error),
+            tray::IDM_LOG_OFF => update_active_log_level(LogLevel::Off),
             tray::IDM_EXIT => unsafe {
                 PostQuitMessage(0);
             },
@@ -251,6 +326,10 @@ static LAST_SHUFFLE_TIME: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
 static APP_CONFIG: std::sync::Mutex<Option<config::AppConfig>> = std::sync::Mutex::new(None);
 
 fn on_debounce_settled() {
+    if IS_PAUSED.load(Ordering::Relaxed) {
+        return;
+    }
+
     let visible_windows = detector::collect_visible_window_rects();
     let current_exposure = detector::calculate_desktop_exposure_rate();
     let is_foreground = logger::is_foreground();
@@ -397,16 +476,46 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig) {
             candidate.source_images.len()
         );
         *LAST_SHUFFLE_TIME.lock().unwrap() = Some(chrono::Utc::now());
+        // Update tray icon with framed miniature of the newly applied wallpaper
+        tray::update_tray_icon_from_file(&candidate.output_path);
+        tray::update_tray_tooltip(&format!("Wallpaper Shuffler ({:?})", candidate.mode));
         // Speculatively pre-compose the next candidate in advance so future reveals are instant
         ensure_candidate_precomposed_async(cfg);
     }
 }
 
+fn update_active_log_level(level: LogLevel) {
+    logger::set_log_level(level);
+    log_info!("Log level changed to {:?}", level);
+    let config_path = get_config_path();
+    let mut guard = APP_CONFIG.lock().unwrap();
+    if let Some(cfg) = guard.as_mut() {
+        cfg.log_level = level.as_str().to_lowercase();
+        let _ = cfg.save_to_file(&config_path);
+    }
+}
+
 fn get_config_path() -> PathBuf {
-    std::env::var("APPDATA")
+    if let Ok(p) = std::env::var("USERPROFILE") {
+        let user_cfg = PathBuf::from(&p)
+            .join(".wallpaper-shuffler")
+            .join("config.json");
+        if user_cfg.exists() {
+            return user_cfg;
+        }
+    }
+    if let Ok(p) = std::env::var("APPDATA") {
+        let appdata_cfg = PathBuf::from(&p)
+            .join("wallpaper-shuffler")
+            .join("config.json");
+        if appdata_cfg.exists() {
+            return appdata_cfg;
+        }
+    }
+    std::env::var("USERPROFILE")
         .map(|p| {
             PathBuf::from(p)
-                .join("wallpaper-shuffler")
+                .join(".wallpaper-shuffler")
                 .join("config.json")
         })
         .unwrap_or_else(|_| PathBuf::from("config.json"))
@@ -504,7 +613,25 @@ fn run_daemon(
         let hwnd = hwnd.unwrap();
         TARGET_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
 
-        let _tray = tray::TrayManager::new(hwnd);
+        // Load most recent wallpaper from history if present to display initial framed tray icon
+        let initial_thumb = if let Ok(entries) = std::fs::read_dir(get_history_dir()) {
+            let mut files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("png")
+                    })
+                })
+                .collect();
+            files.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
+            files
+                .last()
+                .and_then(|p| image::open(p).ok().map(|img| img.to_rgba8()))
+        } else {
+            None
+        };
+        tray::init_tray(hwnd, initial_thumb.as_ref());
         let _hook_guard = hook::install_window_event_hook(win_event_hook_proc);
 
         // Start lightweight safety watch timer (250ms) to guarantee 100% window tracking reliability
