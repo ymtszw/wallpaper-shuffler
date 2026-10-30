@@ -28,8 +28,78 @@ use windows::core::w;
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(400);
 static FOREGROUND_LOGGING: AtomicBool = AtomicBool::new(false);
+static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
+static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
+    std::sync::Mutex::new(None);
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
+
+fn get_history_dir() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .map(|p| PathBuf::from(p).join(".wallpaper-shuffler").join("history"))
+        .unwrap_or_else(|_| PathBuf::from("target").join("history"))
+}
+
+/// Speculatively pre-composes the next wallpaper candidate in a background thread
+/// as soon as window activity is detected, caching it in STANDBY_WALLPAPER.
+fn ensure_candidate_precomposed_async(cfg: &config::AppConfig, log: bool) {
+    // 1. Check if an unconsumed standby candidate is already ready
+    {
+        let guard = STANDBY_WALLPAPER.lock().unwrap();
+        if guard.is_some() {
+            if log {
+                println!(
+                    "[STANDBY CACHE] Ready candidate already standby. Skipping duplicate composition."
+                );
+            }
+            return;
+        }
+    }
+
+    // 2. Prevent overlapping composition tasks
+    if IS_COMPOSING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let wallpaper_dirs = cfg.wallpaper_dirs.clone();
+    let history_count = cfg.history_count;
+    let history_dir = get_history_dir();
+
+    if log {
+        println!(
+            ">>> [SPECULATIVE PRECOMP] Window activity detected. Generating next wallpaper candidate in background thread..."
+        );
+    }
+
+    std::thread::spawn(move || {
+        let res =
+            composer::execute_shuffle_and_compose(&wallpaper_dirs, &history_dir, history_count);
+        match res {
+            Ok(comp_res) => {
+                let log = FOREGROUND_LOGGING.load(Ordering::Relaxed);
+                if log {
+                    println!(
+                        "[PRECOMP READY] Next candidate ({:?}) prepared in {}ms! Stored in standby cache: {}",
+                        comp_res.mode,
+                        comp_res.duration_ms,
+                        comp_res.output_path.display()
+                    );
+                }
+                *STANDBY_WALLPAPER.lock().unwrap() = Some(comp_res);
+            }
+            Err(e) => {
+                let log = FOREGROUND_LOGGING.load(Ordering::Relaxed);
+                if log {
+                    eprintln!("[PRECOMP ERROR] Background composition failed: {}", e);
+                }
+            }
+        }
+        IS_COMPOSING.store(false, Ordering::SeqCst);
+    });
+}
 
 fn attach_parent_console() {
     unsafe {
@@ -68,6 +138,9 @@ unsafe extern "system" fn win_event_hook_proc(
                 None,
             );
         }
+
+        let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+        ensure_candidate_precomposed_async(&cfg, FOREGROUND_LOGGING.load(Ordering::Relaxed));
     }
 }
 
@@ -146,14 +219,23 @@ fn on_debounce_settled() {
         if detector::has_cooldown_elapsed(last_time, cfg.cooldown_seconds) {
             if is_foreground {
                 println!(
-                    ">>> [TRIGGER] Exposure transition detected and cooldown passed! Shuffling wallpaper..."
+                    ">>> [TRIGGER] Exposure transition detected ({:.1}% -> {:.1}%) and cooldown passed!",
+                    prev_exposure, current_exposure
                 );
             }
-            perform_shuffle(&cfg, is_foreground);
+            apply_or_await_wallpaper(&cfg, is_foreground);
         } else if is_foreground {
             println!(
-                "[COOLDOWN] Transition detected, but cooldown ({}s) has not yet elapsed.",
+                "[COOLDOWN] Transition detected, but cooldown ({}s) has not yet elapsed. Standby candidate preserved.",
                 cfg.cooldown_seconds
+            );
+        }
+    } else if is_foreground {
+        let has_standby = STANDBY_WALLPAPER.lock().unwrap().is_some();
+        if has_standby {
+            println!(
+                "[STANDBY RETAINED] Desktop not exposed ({:.1}% < {:.1}%). Standby wallpaper held in memory for next reveal.",
+                current_exposure, cfg.exposed_threshold_percent
             );
         }
     }
@@ -165,48 +247,78 @@ fn trigger_manual_shuffle() {
     if is_foreground {
         println!(">>> [MANUAL TRIGGER] Shuffle requested from tray or CLI.");
     }
-    perform_shuffle(&cfg, is_foreground);
+    apply_or_await_wallpaper(&cfg, is_foreground);
 }
 
-fn perform_shuffle(cfg: &config::AppConfig, log: bool) {
-    let history_dir = std::env::var("USERPROFILE")
-        .map(|p| PathBuf::from(p).join(".wallpaper-shuffler").join("history"))
-        .unwrap_or_else(|_| PathBuf::from("target").join("history"));
+fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
+    // 1. Take candidate from standby cache if ready
+    let mut candidate = STANDBY_WALLPAPER.lock().unwrap().take();
 
-    match composer::execute_shuffle_and_compose(
-        &cfg.wallpaper_dirs,
-        &history_dir,
-        cfg.history_count,
-    ) {
-        Ok(res) => {
-            if log {
-                println!(
-                    "[COMPOSED] Mode: {:?} | Time: {}ms | Output: {}",
-                    res.mode,
-                    res.duration_ms,
-                    res.output_path.display()
-                );
-                println!(
-                    "           Used {} source image(s)",
-                    res.source_images.len()
-                );
-            }
-
-            if let Err(e) = wallpaper::set_wallpaper(&res.output_path) {
-                if log {
-                    eprintln!("[ERROR] Failed to apply wallpaper: {}", e);
+    // 2. If background pre-composition is still running, wait for completion (up to 2000ms)
+    if candidate.is_none() && IS_COMPOSING.load(Ordering::SeqCst) {
+        if log {
+            println!(
+                "[AWAIT PRECOMP] Background composition in progress. Awaiting completion for instant application..."
+            );
+        }
+        let start = Instant::now();
+        while start.elapsed().as_millis() < 2000 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            candidate = STANDBY_WALLPAPER.lock().unwrap().take();
+            if candidate.is_some() || !IS_COMPOSING.load(Ordering::SeqCst) {
+                if candidate.is_none() {
+                    candidate = STANDBY_WALLPAPER.lock().unwrap().take();
                 }
-            } else if log {
-                println!("[WALLPAPER APPLIED] Successfully updated Windows wallpaper!");
+                break;
             }
+        }
+    }
 
-            *LAST_SHUFFLE_TIME.lock().unwrap() = Some(chrono::Utc::now());
-        }
-        Err(e) => {
+    // 3. Fallback: synchronously compose if standby was empty
+    let candidate = match candidate {
+        Some(c) => {
             if log {
-                eprintln!("[ERROR] Shuffle composition failed: {}", e);
+                println!(
+                    "[STANDBY HIT] Applying pre-composed {:?} wallpaper with ZERO wait time! ({})",
+                    c.mode,
+                    c.output_path.display()
+                );
+            }
+            c
+        }
+        None => {
+            if log {
+                println!("[SYNC FALLBACK] No standby image ready, synthesizing synchronously...");
+            }
+            let history_dir = get_history_dir();
+            match composer::execute_shuffle_and_compose(
+                &cfg.wallpaper_dirs,
+                &history_dir,
+                cfg.history_count,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    if log {
+                        eprintln!("[ERROR] Fallback composition failed: {}", e);
+                    }
+                    return;
+                }
             }
         }
+    };
+
+    if let Err(e) = wallpaper::set_wallpaper(&candidate.output_path) {
+        if log {
+            eprintln!("[ERROR] Failed to set wallpaper: {}", e);
+        }
+    } else {
+        if log {
+            println!(
+                "[WALLPAPER APPLIED] Successfully updated Windows wallpaper! (Used {} images)",
+                candidate.source_images.len()
+            );
+        }
+        *LAST_SHUFFLE_TIME.lock().unwrap() = Some(chrono::Utc::now());
     }
 }
 
