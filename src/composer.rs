@@ -248,7 +248,10 @@ pub fn decorate_photo_card(src: &RgbImage, style: FrameStyle) -> RgbaImage {
     if let FrameStyle::WoodFrame = style {
         for y in 0..card_h {
             for x in 0..card_w {
-                let edge = x == 5 || x == card_w - 6 || y == 5 || y == card_h - 6;
+                let edge = (5..=6).contains(&x)
+                    || (card_w - 7..=card_w - 6).contains(&x)
+                    || (5..=6).contains(&y)
+                    || (card_h - 7..=card_h - 6).contains(&y);
                 if edge {
                     card.put_pixel(x, y, Rgba([185, 155, 95, 255]));
                 }
@@ -266,15 +269,15 @@ pub fn decorate_photo_card(src: &RgbImage, style: FrameStyle) -> RgbaImage {
     card
 }
 
-/// Bilinear rotation with alpha channel. Angles are kept gentle (-12 deg to +12 deg).
+/// High-quality bilinear rotation with sub-pixel boundary anti-aliasing to eliminate jaggies
 pub fn rotate_rgba(src: &RgbaImage, angle_rad: f32) -> RgbaImage {
     let sw = src.width() as f32;
     let sh = src.height() as f32;
     let cos_a = angle_rad.cos();
     let sin_a = angle_rad.sin();
 
-    let nw = (sw * cos_a.abs() + sh * sin_a.abs()).ceil() as u32;
-    let nh = (sw * sin_a.abs() + sh * cos_a.abs()).ceil() as u32;
+    let nw = (sw * cos_a.abs() + sh * sin_a.abs()).ceil() as u32 + 2;
+    let nh = (sw * sin_a.abs() + sh * cos_a.abs()).ceil() as u32 + 2;
 
     let mut dest = RgbaImage::new(nw, nh);
     let src_cx = sw / 2.0;
@@ -289,13 +292,26 @@ pub fn rotate_rgba(src: &RgbaImage, angle_rad: f32) -> RgbaImage {
             let sx = x_diff * cos_a + y_diff * sin_a + src_cx;
             let sy = -x_diff * sin_a + y_diff * cos_a + src_cy;
 
-            if sx >= 0.0 && sx < sw - 1.0 && sy >= 0.0 && sy < sh - 1.0 {
-                let x0 = sx.floor() as u32;
-                let y0 = sy.floor() as u32;
-                let x1 = x0 + 1;
-                let y1 = y0 + 1;
-                let fx = sx - x0 as f32;
-                let fy = sy - y0 as f32;
+            // Signed distance to the 4 card boundaries [0..sw] x [0..sh]
+            let dist_left = sx;
+            let dist_right = sw - sx;
+            let dist_top = sy;
+            let dist_bottom = sh - sy;
+            let min_dist = dist_left.min(dist_right).min(dist_top.min(dist_bottom));
+
+            if min_dist > -0.5 {
+                // Sub-pixel edge anti-aliasing coverage ramp over 1-pixel boundary
+                let edge_coverage = (min_dist + 0.5).clamp(0.0, 1.0);
+
+                let clamp_sx = sx.clamp(0.0, sw - 1.001);
+                let clamp_sy = sy.clamp(0.0, sh - 1.001);
+
+                let x0 = clamp_sx.floor() as u32;
+                let y0 = clamp_sy.floor() as u32;
+                let x1 = (x0 + 1).min(src.width() - 1);
+                let y1 = (y0 + 1).min(src.height() - 1);
+                let fx = clamp_sx - x0 as f32;
+                let fy = clamp_sy - y0 as f32;
 
                 let p00 = src.get_pixel(x0, y0);
                 let p10 = src.get_pixel(x1, y0);
@@ -303,12 +319,20 @@ pub fn rotate_rgba(src: &RgbaImage, angle_rad: f32) -> RgbaImage {
                 let p11 = src.get_pixel(x1, y1);
 
                 let mut rgba = [0u8; 4];
-                for i in 0..4 {
+                for i in 0..3 {
                     let top = p00[i] as f32 * (1.0 - fx) + p10[i] as f32 * fx;
                     let bot = p01[i] as f32 * (1.0 - fx) + p11[i] as f32 * fx;
                     rgba[i] = (top * (1.0 - fy) + bot * fy).clamp(0.0, 255.0) as u8;
                 }
-                dest.put_pixel(dx, dy, Rgba(rgba));
+                let top_a = p00[3] as f32 * (1.0 - fx) + p10[3] as f32 * fx;
+                let bot_a = p01[3] as f32 * (1.0 - fx) + p11[3] as f32 * fx;
+                let sampled_a = (top_a * (1.0 - fy) + bot_a * fy).clamp(0.0, 255.0);
+                let final_a = (sampled_a * edge_coverage).round().clamp(0.0, 255.0) as u8;
+                rgba[3] = final_a;
+
+                if final_a > 0 {
+                    dest.put_pixel(dx, dy, Rgba(rgba));
+                }
             }
         }
     }

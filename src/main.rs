@@ -169,17 +169,15 @@ fn ensure_candidate_precomposed_async(cfg: &config::AppConfig) {
     let history_count = cfg.history_count;
     let history_dir = get_history_dir();
 
-    log_debug!(
-        ">>> [SPECULATIVE PRECOMP] Window activity detected. Generating next wallpaper candidate in background thread..."
-    );
+    log_info!(">>> [GENERATE START] Generating wallpaper candidate in background thread...");
 
     std::thread::spawn(move || {
         let res =
             composer::execute_shuffle_and_compose(&wallpaper_dirs, &history_dir, history_count);
         match res {
             Ok(comp_res) => {
-                log_debug!(
-                    "[PRECOMP READY] Next candidate ({:?}) prepared in {}ms! Stored in standby cache: {}",
+                log_info!(
+                    "[GENERATE READY] Composed {:?} wallpaper in {}ms (Standby: {})",
                     comp_res.mode,
                     comp_res.duration_ms,
                     comp_res.output_path.display()
@@ -187,7 +185,7 @@ fn ensure_candidate_precomposed_async(cfg: &config::AppConfig) {
                 *STANDBY_WALLPAPER.lock().unwrap() = Some(comp_res);
             }
             Err(e) => {
-                log_error!("[PRECOMP ERROR] Background composition failed: {}", e);
+                log_error!("[GENERATE ERROR] Background composition failed: {}", e);
             }
         }
         IS_COMPOSING.store(false, Ordering::SeqCst);
@@ -411,7 +409,7 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig) {
     // 3. Fallback: synchronously compose if standby was empty
     let candidate = match candidate {
         Some(c) => {
-            log_debug!(
+            log_info!(
                 "[STANDBY HIT] Applying pre-composed {:?} wallpaper with ZERO wait time! ({})",
                 c.mode,
                 c.output_path.display()
@@ -419,14 +417,21 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig) {
             c
         }
         None => {
-            log_info!("[SYNC FALLBACK] No standby image ready, synthesizing synchronously...");
+            log_info!("[SYNC GENERATION] No standby image ready, synthesizing synchronously...");
             let history_dir = get_history_dir();
             match composer::execute_shuffle_and_compose(
                 &cfg.wallpaper_dirs,
                 &history_dir,
                 cfg.history_count,
             ) {
-                Ok(c) => c,
+                Ok(c) => {
+                    log_info!(
+                        "[SYNC READY] Composed {:?} wallpaper in {}ms",
+                        c.mode,
+                        c.duration_ms
+                    );
+                    c
+                }
                 Err(e) => {
                     log_error!("[ERROR] Fallback composition failed: {}", e);
                     return;
