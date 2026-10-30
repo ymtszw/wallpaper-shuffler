@@ -491,27 +491,23 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
 
     let mut rng = rand::thread_rng();
 
-    // Randomize candidates without landscape bias (portraits naturally dominate)
+    // Deduplicate candidate paths
     let mut candidate_paths: Vec<PathBuf> = images.to_vec();
+    candidate_paths.sort();
+    candidate_paths.dedup();
     candidate_paths.shuffle(&mut rng);
 
     let mut loaded = Vec::new();
     for p in &candidate_paths {
         if let Ok(src) = load_rgb_image(p) {
             loaded.push(src);
-            if loaded.len() >= 10 {
+            if loaded.len() >= 16 {
                 break;
             }
         }
     }
     if loaded.is_empty() {
         return Err("Failed to load any valid images for collage".to_string());
-    }
-
-    // Guarantee minimum 7 images for collage composition (5 primary + at least 2 underlay)
-    while loaded.len() < 7 {
-        let clone_img = loaded[loaded.len() % loaded.len()].clone();
-        loaded.push(clone_img);
     }
 
     let preset = next_rotated_ambient_gradient();
@@ -550,11 +546,16 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         })
         .collect();
 
-    // 1. Determine primary cards count (enforce 5+ images: 5 or 6)
-    let primary_count = if prepared_cards.len() >= 6 && rng.gen_bool(0.3) {
-        6
+    // 1. Determine primary cards count without duplicates
+    let available = prepared_cards.len();
+    let primary_count = if available >= 7 {
+        if available >= 8 && rng.gen_bool(0.3) {
+            6
+        } else {
+            5
+        }
     } else {
-        5
+        available.saturating_sub(2).max(1)
     };
 
     let anchors_5 = [
@@ -749,6 +750,8 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     let mut rng = rand::thread_rng();
 
     let mut candidate_paths: Vec<PathBuf> = images.to_vec();
+    candidate_paths.sort();
+    candidate_paths.dedup();
     candidate_paths.shuffle(&mut rng);
 
     let mut loaded = Vec::new();
@@ -811,7 +814,9 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
         img: first_scaled,
     });
 
-    let mut img_idx = 1;
+    // Set of unused image indices to strictly avoid ANY duplicate image
+    let mut unused_indices: Vec<usize> = (1..loaded.len()).collect();
+    unused_indices.shuffle(&mut rng);
     let mut attempts = 0;
 
     let overlaps_any = |cand: &RectI32, list: &[RectI32]| -> bool {
@@ -856,7 +861,7 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
     };
 
     // Outward packing with bold uniform gap (30px) and balanced coverage
-    while attempts < 35 {
+    while attempts < 35 && !unused_indices.is_empty() {
         attempts += 1;
 
         let uncovered_target = find_uncovered_center_biased_point(&placed_rects);
@@ -866,114 +871,124 @@ pub fn compose_tiling(images: &[PathBuf]) -> Result<RgbImage, String> {
 
         let target_pt = uncovered_target.unwrap_or((canvas_cx, canvas_cy));
 
-        let src = &loaded[img_idx % loaded.len()];
-        img_idx += 1;
+        let mut placed_index_pos = None;
 
-        let max_dim = rng.gen_range(1100..=1450);
-        let scaled = fit_downscale_only(src, max_dim);
-        let w = scaled.width() as i32;
-        let h = scaled.height() as i32;
+        for (pos, &cand_img_idx) in unused_indices.iter().enumerate() {
+            let src = &loaded[cand_img_idx];
+            let max_dim = rng.gen_range(1100..=1450);
+            let scaled = fit_downscale_only(src, max_dim);
+            let w = scaled.width() as i32;
+            let h = scaled.height() as i32;
 
-        let mut candidates = Vec::new();
-        for r in &placed_rects {
-            // Right edge alignments
-            candidates.push(RectI32 {
-                x: r.right() + bold_gap,
-                y: r.y,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.right() + bold_gap,
-                y: r.y + (r.h - h) / 2,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.right() + bold_gap,
-                y: r.bottom() - h,
-                w,
-                h,
+            let mut candidates = Vec::new();
+            for r in &placed_rects {
+                // Right edge alignments
+                candidates.push(RectI32 {
+                    x: r.right() + bold_gap,
+                    y: r.y,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.right() + bold_gap,
+                    y: r.y + (r.h - h) / 2,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.right() + bold_gap,
+                    y: r.bottom() - h,
+                    w,
+                    h,
+                });
+
+                // Left edge alignments
+                candidates.push(RectI32 {
+                    x: r.x - bold_gap - w,
+                    y: r.y,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.x - bold_gap - w,
+                    y: r.y + (r.h - h) / 2,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.x - bold_gap - w,
+                    y: r.bottom() - h,
+                    w,
+                    h,
+                });
+
+                // Top edge alignments
+                candidates.push(RectI32 {
+                    x: r.x,
+                    y: r.y - bold_gap - h,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.x + (r.w - w) / 2,
+                    y: r.y - bold_gap - h,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.right() - w,
+                    y: r.y - bold_gap - h,
+                    w,
+                    h,
+                });
+
+                // Bottom edge alignments
+                candidates.push(RectI32 {
+                    x: r.x,
+                    y: r.bottom() + bold_gap,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.x + (r.w - w) / 2,
+                    y: r.bottom() + bold_gap,
+                    w,
+                    h,
+                });
+                candidates.push(RectI32 {
+                    x: r.right() - w,
+                    y: r.bottom() + bold_gap,
+                    w,
+                    h,
+                });
+            }
+
+            candidates.sort_by_key(|c| {
+                let cx = c.x + c.w / 2;
+                let cy = c.y + c.h / 2;
+                let dx = cx - target_pt.0;
+                let dy = cy - target_pt.1;
+                (dx * dx + dy * dy) as u64
             });
 
-            // Left edge alignments
-            candidates.push(RectI32 {
-                x: r.x - bold_gap - w,
-                y: r.y,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.x - bold_gap - w,
-                y: r.y + (r.h - h) / 2,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.x - bold_gap - w,
-                y: r.bottom() - h,
-                w,
-                h,
-            });
-
-            // Top edge alignments
-            candidates.push(RectI32 {
-                x: r.x,
-                y: r.y - bold_gap - h,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.x + (r.w - w) / 2,
-                y: r.y - bold_gap - h,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.right() - w,
-                y: r.y - bold_gap - h,
-                w,
-                h,
-            });
-
-            // Bottom edge alignments
-            candidates.push(RectI32 {
-                x: r.x,
-                y: r.bottom() + bold_gap,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.x + (r.w - w) / 2,
-                y: r.bottom() + bold_gap,
-                w,
-                h,
-            });
-            candidates.push(RectI32 {
-                x: r.right() - w,
-                y: r.bottom() + bold_gap,
-                w,
-                h,
-            });
+            if let Some(best) = candidates
+                .into_iter()
+                .find(|c| !overlaps_any(c, &placed_rects))
+            {
+                placed_rects.push(best);
+                placed.push(PlacedImage {
+                    rect: best,
+                    img: scaled,
+                });
+                placed_index_pos = Some(pos);
+                break;
+            }
         }
 
-        candidates.sort_by_key(|c| {
-            let cx = c.x + c.w / 2;
-            let cy = c.y + c.h / 2;
-            let dx = cx - target_pt.0;
-            let dy = cy - target_pt.1;
-            (dx * dx + dy * dy) as u64
-        });
-
-        if let Some(best) = candidates
-            .into_iter()
-            .find(|c| !overlaps_any(c, &placed_rects))
-        {
-            placed_rects.push(best);
-            placed.push(PlacedImage {
-                rect: best,
-                img: scaled,
-            });
+        if let Some(pos) = placed_index_pos {
+            unused_indices.swap_remove(pos);
+        } else {
+            break;
         }
     }
 
@@ -1037,6 +1052,9 @@ pub fn collect_image_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
             }
         }
     }
+    // Deduplicate file paths
+    files.sort();
+    files.dedup();
     files
 }
 
@@ -1087,12 +1105,12 @@ pub fn execute_shuffle_and_compose(
     } else {
         let use_tiling = rng.gen_bool(0.5);
         if use_tiling {
-            let count = 10.min(images.len());
+            let count = 25.min(images.len());
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_tiling(&selected)?;
             (CompositionMode::Tiling, img, selected)
         } else {
-            let count = 10.min(images.len());
+            let count = 20.min(images.len());
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (CompositionMode::Collage, img, selected)
@@ -1143,6 +1161,8 @@ pub fn execute_mode_explicit(
 
     let mut rng = rand::thread_rng();
     let mut pool = images.to_vec();
+    pool.sort();
+    pool.dedup();
     pool.shuffle(&mut rng);
 
     let (composed, used) = match mode {
@@ -1163,13 +1183,13 @@ pub fn execute_mode_explicit(
             (img, vec![single_img.clone()])
         }
         CompositionMode::Collage => {
-            let count = pool.len().min(10);
+            let count = pool.len().min(20);
             let selected: Vec<PathBuf> = pool.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (img, selected)
         }
         CompositionMode::Tiling => {
-            let count = pool.len().min(12);
+            let count = pool.len().min(25);
             let selected: Vec<PathBuf> = pool.iter().take(count).cloned().collect();
             let img = compose_tiling(&selected)?;
             (img, selected)
