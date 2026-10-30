@@ -107,6 +107,18 @@ fn attach_parent_console() {
     }
 }
 
+fn event_name(event: u32) -> &'static str {
+    match event {
+        0x0003 => "FOREGROUND_CHANGE",
+        0x000A => "MOVESIZE_START",
+        0x000B => "MOVESIZE_END",
+        0x0016 => "MINIMIZE_START",
+        0x0017 => "MINIMIZE_END",
+        0x800B => "LOCATION_CHANGE",
+        _ => "WINDOW_ACTIVITY",
+    }
+}
+
 unsafe extern "system" fn win_event_hook_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -133,8 +145,9 @@ unsafe extern "system" fn win_event_hook_proc(
 
     if FOREGROUND_LOGGING.load(Ordering::Relaxed) {
         println!(
-            "[EVENT 0x{:04X}] Window activity detected on HWND {:?}. Resetting debounce timer...",
-            event, hwnd.0
+            "[EVENT: {}] Activity on HWND {:?}. Resetting debounce timer & pre-composing...",
+            event_name(event),
+            hwnd.0
         );
     }
 
@@ -221,30 +234,53 @@ fn on_debounce_settled() {
         );
     }
 
-    let transitioned = prev_exposure < cfg.obscured_threshold_percent
-        && current_exposure >= cfg.exposed_threshold_percent;
+    // Trigger condition:
+    // 1. Classical transition: hidden (< 10%) -> exposed (>= 20%)
+    // 2. Window rearrangement / resizing / moving while desktop is exposed (>= 20%)
+    let is_desktop_exposed = current_exposure >= cfg.exposed_threshold_percent;
+    let is_transition = prev_exposure < cfg.obscured_threshold_percent && is_desktop_exposed;
+    let is_rearranged = is_desktop_exposed; // Window moved or resized while desktop is visible
 
-    if transitioned {
+    let should_trigger = is_transition || is_rearranged;
+
+    if should_trigger {
         let last_time = *LAST_SHUFFLE_TIME.lock().unwrap();
-        if detector::has_cooldown_elapsed(last_time, cfg.cooldown_seconds) {
+        let effective_cooldown = if is_foreground {
+            5 // Short 5-second cooldown during foreground testing for instant responsive feedback
+        } else {
+            cfg.cooldown_seconds
+        };
+
+        if detector::has_cooldown_elapsed(last_time, effective_cooldown) {
             if is_foreground {
+                let reason = if is_transition {
+                    format!(
+                        "Hidden-to-exposed transition ({:.1}% -> {:.1}%)",
+                        prev_exposure, current_exposure
+                    )
+                } else {
+                    format!(
+                        "Window moved/resized while desktop visible ({:.1}%)",
+                        current_exposure
+                    )
+                };
                 println!(
-                    ">>> [TRIGGER] Exposure transition detected ({:.1}% -> {:.1}%) and cooldown passed!",
-                    prev_exposure, current_exposure
+                    ">>> [TRIGGER: {}] Window settled & cooldown passed! Applying wallpaper...",
+                    reason
                 );
             }
             apply_or_await_wallpaper(&cfg, is_foreground);
         } else if is_foreground {
             println!(
-                "[COOLDOWN] Transition detected, but cooldown ({}s) has not yet elapsed. Standby candidate preserved.",
-                cfg.cooldown_seconds
+                "[COOLDOWN] Window settled, but cooldown ({}s) has not elapsed yet. Standby candidate preserved.",
+                effective_cooldown
             );
         }
     } else if is_foreground {
         let has_standby = STANDBY_WALLPAPER.lock().unwrap().is_some();
         if has_standby {
             println!(
-                "[STANDBY RETAINED] Desktop not exposed ({:.1}% < {:.1}%). Standby wallpaper held in memory for next reveal.",
+                "[STANDBY RETAINED] Desktop covered ({:.1}% < {:.1}%). Standby wallpaper held in memory for next reveal.",
                 current_exposure, cfg.exposed_threshold_percent
             );
         }
