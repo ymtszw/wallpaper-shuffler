@@ -33,6 +33,58 @@ static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> 
     std::sync::Mutex::new(None);
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
+const TIMER_WATCH_ID: usize = 9002;
+
+static LAST_WATCH_STATE: std::sync::Mutex<Option<(usize, f64)>> = std::sync::Mutex::new(None);
+
+fn on_window_activity_detected(source: &str) {
+    let target = TARGET_HWND.load(Ordering::Relaxed);
+    if target == 0 {
+        return;
+    }
+
+    if FOREGROUND_LOGGING.load(Ordering::Relaxed) {
+        println!(
+            "[{}] Window movement/resize/minimize detected! Pre-composing next wallpaper...",
+            source
+        );
+    }
+
+    let debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed) as u32;
+    unsafe {
+        let _ = SetTimer(
+            Some(HWND(target as *mut _)),
+            TIMER_DEBOUNCE_ID,
+            debounce_ms,
+            None,
+        );
+    }
+
+    let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+    ensure_candidate_precomposed_async(&cfg, FOREGROUND_LOGGING.load(Ordering::Relaxed));
+}
+
+fn check_window_watch() {
+    let visible_windows = detector::collect_visible_window_rects();
+    let current_exposure = detector::calculate_desktop_exposure_rate();
+
+    let mut guard = LAST_WATCH_STATE.lock().unwrap();
+    if let Some((prev_count, prev_exp)) = *guard {
+        // Window moved, minimized, closed, or resized (exposure or window count changed)
+        if prev_count != visible_windows.len() || (prev_exp - current_exposure).abs() >= 1.0 {
+            *guard = Some((visible_windows.len(), current_exposure));
+            on_window_activity_detected(&format!(
+                "WATCH (Windows: {} -> {}, Exposure: {:.1}% -> {:.1}%)",
+                prev_count,
+                visible_windows.len(),
+                prev_exp,
+                current_exposure
+            ));
+            return;
+        }
+    }
+    *guard = Some((visible_windows.len(), current_exposure));
+}
 
 fn get_history_dir() -> PathBuf {
     std::env::var("USERPROFILE")
@@ -143,26 +195,7 @@ unsafe extern "system" fn win_event_hook_proc(
         return;
     }
 
-    if FOREGROUND_LOGGING.load(Ordering::Relaxed) {
-        println!(
-            "[EVENT: {}] Activity on HWND {:?}. Resetting debounce timer & pre-composing...",
-            event_name(event),
-            hwnd.0
-        );
-    }
-
-    let debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed) as u32;
-    unsafe {
-        let _ = SetTimer(
-            Some(HWND(target as *mut _)),
-            TIMER_DEBOUNCE_ID,
-            debounce_ms,
-            None,
-        );
-    }
-
-    let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
-    ensure_candidate_precomposed_async(&cfg, FOREGROUND_LOGGING.load(Ordering::Relaxed));
+    on_window_activity_detected(&format!("HOOK: {}", event_name(event)));
 }
 
 unsafe extern "system" fn window_proc(
@@ -178,6 +211,9 @@ unsafe extern "system" fn window_proc(
                     let _ = KillTimer(Some(hwnd), TIMER_DEBOUNCE_ID);
                 }
                 on_debounce_settled();
+                return LRESULT(0);
+            } else if wparam.0 == TIMER_WATCH_ID {
+                check_window_watch();
                 return LRESULT(0);
             }
         }
@@ -451,6 +487,9 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
 
         let _tray = tray::TrayManager::new(hwnd);
         let _hook_guard = hook::install_window_event_hook(win_event_hook_proc);
+
+        // Start lightweight safety watch timer (250ms) to guarantee 100% window tracking reliability
+        let _ = SetTimer(Some(hwnd), TIMER_WATCH_ID, 250, None);
 
         let visible_windows = detector::collect_visible_window_rects();
         let initial_exposure = detector::calculate_desktop_exposure_rate();

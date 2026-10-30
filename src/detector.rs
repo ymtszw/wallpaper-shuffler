@@ -1,11 +1,9 @@
 use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_CHILD, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetDesktopWindow,
-    GetShellWindow, GetSystemMetrics, GetWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
-    IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    WS_EX_TOOLWINDOW, WS_VISIBLE,
+    EnumWindows, GW_CHILD, GW_HWNDNEXT, GetDesktopWindow, GetSystemMetrics, GetWindow,
+    GetWindowRect, IsIconic, IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 use windows::core::BOOL;
 
@@ -58,42 +56,7 @@ pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
             return false;
         }
 
-        if hwnd == GetShellWindow() {
-            return false;
-        }
-
-        let mut class_buf = [0u16; 64];
-        let len = GetClassNameW(hwnd, &mut class_buf) as usize;
-        if len > 0 {
-            let class_name = String::from_utf16_lossy(&class_buf[..len]);
-            if class_name == "Progman" || class_name == "WorkerW" {
-                return false;
-            }
-        }
-
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            return false;
-        }
-
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        if style & WS_VISIBLE.0 == 0 {
-            return false;
-        }
-
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
-            return false;
-        }
-
-        // Check if window is cloaked by DWM (e.g. background virtual desktop or suspended modern app)
-        let mut cloaked: u32 = 0;
-        let hr = DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            &mut cloaked as *mut _ as *mut _,
-            std::mem::size_of::<u32>() as u32,
-        );
-        if hr.is_ok() && cloaked != 0 {
             return false;
         }
 
@@ -104,7 +67,8 @@ pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
 
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
-        w > 0 && h > 0
+        // Real interactive windows on desktop have tangible dimensions (>= 120x80)
+        w >= 120 && h >= 80
     }
 }
 
