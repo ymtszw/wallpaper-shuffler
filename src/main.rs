@@ -10,17 +10,16 @@ mod startup;
 mod tray;
 mod wallpaper;
 
-use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect, KillTimer, MSG,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, MSG,
     PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WM_COMMAND, WM_CONTEXTMENU,
     WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
@@ -32,9 +31,7 @@ static FOREGROUND_LOGGING: AtomicBool = AtomicBool::new(false);
 static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
 static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
     std::sync::Mutex::new(None);
-
-type WindowRectCache = HashMap<isize, (i32, i32, i32, i32)>;
-static LAST_WINDOW_RECTS: std::sync::Mutex<Option<WindowRectCache>> = std::sync::Mutex::new(None);
+static WAS_DESKTOP_OBSCURED: AtomicBool = AtomicBool::new(true);
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
 const TIMER_WATCH_ID: usize = 9002;
@@ -170,7 +167,6 @@ fn event_name(event: u32) -> &'static str {
         0x000B => "MOVESIZE_END",
         0x0016 => "MINIMIZE_START",
         0x0017 => "MINIMIZE_END",
-        0x800B => "LOCATION_CHANGE",
         _ => "WINDOW_ACTIVITY",
     }
 }
@@ -190,8 +186,7 @@ unsafe extern "system" fn win_event_hook_proc(
     }
 
     // Only process window-level events (OBJID_WINDOW = 0).
-    // Specifically ignore child/client controls (OBJID_CLIENT = -4, OBJID_CURSOR = -9)
-    // which fire incessantly during mouse hovering or caret motion.
+    // Child controls (OBJID_CLIENT, OBJID_CURSOR, etc.) are ignored.
     if id_object != 0 {
         return;
     }
@@ -201,24 +196,12 @@ unsafe extern "system" fn win_event_hook_proc(
         return;
     }
 
-    // For EVENT_OBJECT_LOCATIONCHANGE (0x800B), verify whether the window bounds actually changed.
-    // Windows accessibility fires LOCATIONCHANGE on mouse cursor movement and internal control updates.
-    if event == 0x800B {
-        let mut rect = RECT::default();
-        if unsafe { GetWindowRect(hwnd, &mut rect).is_ok() } {
-            let current_rect = (rect.left, rect.top, rect.right, rect.bottom);
-            let mut cache_guard = LAST_WINDOW_RECTS.lock().unwrap();
-            let cache = cache_guard.get_or_insert_with(HashMap::new);
-            if cache.get(&(hwnd.0 as isize)) == Some(&current_rect) {
-                // Window position and dimensions have not changed at all (e.g. mouse hover)
-                return;
-            }
-            cache.insert(hwnd.0 as isize, current_rect);
-        }
-    }
-
     on_window_activity_detected(&format!("HOOK: {}", event_name(event)));
 }
+
+const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
 
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
@@ -237,6 +220,19 @@ unsafe extern "system" fn window_proc(
             } else if wparam.0 == TIMER_WATCH_ID {
                 check_window_watch();
                 return LRESULT(0);
+            }
+        }
+        WM_POWERBROADCAST => {
+            if wparam.0 == PBT_APMRESUMEAUTOMATIC || wparam.0 == PBT_APMRESUMESUSPEND {
+                let is_fg = FOREGROUND_LOGGING.load(Ordering::Relaxed);
+                if is_fg {
+                    println!(
+                        ">>> [POWER RESUME] System resumed from sleep/suspend. Triggering wallpaper shuffle..."
+                    );
+                }
+                WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
+                let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+                apply_or_await_wallpaper(&cfg, is_fg);
             }
         }
         tray::WM_TRAYICON => {
@@ -281,67 +277,72 @@ fn on_debounce_settled() {
 
     let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
 
-    if is_foreground {
-        println!(
-            "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%)",
-            visible_windows.len(),
-            current_exposure,
-            prev_exposure,
-            cfg.obscured_threshold_percent,
-            cfg.exposed_threshold_percent
-        );
+    // 1. If desktop is obscured (< 5.0%), arm the transition state
+    if current_exposure < cfg.obscured_threshold_percent {
+        WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
+        if is_foreground {
+            println!(
+                "[DESKTOP COVERED] Windows: {} | Exposure: {:.1}% (< {:.1}% threshold). Armed for next reveal!",
+                visible_windows.len(),
+                current_exposure,
+                cfg.obscured_threshold_percent
+            );
+        }
+        return;
     }
 
-    // Trigger condition:
-    // 1. Classical transition: hidden (< 10%) -> exposed (>= 20%)
-    // 2. Window rearrangement / resizing / moving while desktop is exposed (>= 20%)
-    let is_desktop_exposed = current_exposure >= cfg.exposed_threshold_percent;
-    let is_transition = prev_exposure < cfg.obscured_threshold_percent && is_desktop_exposed;
-    let is_rearranged = is_desktop_exposed; // Window moved or resized while desktop is visible
+    // 2. If desktop is exposed (>= 15.0%)
+    if current_exposure >= cfg.exposed_threshold_percent {
+        let was_obscured = WAS_DESKTOP_OBSCURED.load(Ordering::SeqCst);
+        if is_foreground {
+            println!(
+                "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%, Armed: {})",
+                visible_windows.len(),
+                current_exposure,
+                prev_exposure,
+                cfg.obscured_threshold_percent,
+                cfg.exposed_threshold_percent,
+                was_obscured
+            );
+        }
 
-    let should_trigger = is_transition || is_rearranged;
+        if was_obscured {
+            let last_time = *LAST_SHUFFLE_TIME.lock().unwrap();
+            let effective_cooldown = if is_foreground {
+                5 // Short 5-second cooldown during foreground testing for instant responsive feedback
+            } else {
+                cfg.cooldown_seconds
+            };
 
-    if should_trigger {
-        let last_time = *LAST_SHUFFLE_TIME.lock().unwrap();
-        let effective_cooldown = if is_foreground {
-            5 // Short 5-second cooldown during foreground testing for instant responsive feedback
-        } else {
-            cfg.cooldown_seconds
-        };
-
-        if detector::has_cooldown_elapsed(last_time, effective_cooldown) {
-            if is_foreground {
-                let reason = if is_transition {
-                    format!(
-                        "Hidden-to-exposed transition ({:.1}% -> {:.1}%)",
-                        prev_exposure, current_exposure
-                    )
-                } else {
-                    format!(
-                        "Window moved/resized while desktop visible ({:.1}%)",
-                        current_exposure
-                    )
-                };
+            if detector::has_cooldown_elapsed(last_time, effective_cooldown) {
+                if is_foreground {
+                    println!(
+                        ">>> [TRIGGER: REVEAL] Desktop transitioned from covered to exposed ({:.1}% >= {:.1}%)! Applying wallpaper...",
+                        current_exposure, cfg.exposed_threshold_percent
+                    );
+                }
+                apply_or_await_wallpaper(&cfg, is_foreground);
+                WAS_DESKTOP_OBSCURED.store(false, Ordering::SeqCst);
+            } else if is_foreground {
                 println!(
-                    ">>> [TRIGGER: {}] Window settled & cooldown passed! Applying wallpaper...",
-                    reason
+                    "[COOLDOWN] Window settled & desktop exposed, but cooldown ({}s) has not elapsed yet. Standby candidate preserved.",
+                    effective_cooldown
                 );
             }
-            apply_or_await_wallpaper(&cfg, is_foreground);
         } else if is_foreground {
             println!(
-                "[COOLDOWN] Window settled, but cooldown ({}s) has not elapsed yet. Standby candidate preserved.",
-                effective_cooldown
+                "[EXPOSED (NO TRIGGER)] Desktop remains exposed ({:.1}% >= {:.1}%). Skipping shuffle (waiting for desktop to be covered < {:.1}% first).",
+                current_exposure, cfg.exposed_threshold_percent, cfg.obscured_threshold_percent
             );
         }
     } else if is_foreground {
-        let has_standby = STANDBY_WALLPAPER.lock().unwrap().is_some();
-        if has_standby {
-            println!(
-                "[STANDBY RETAINED] Desktop covered ({:.1}% < {:.1}%). Standby wallpaper held in memory for next reveal.",
-                current_exposure, cfg.exposed_threshold_percent
-            );
-        }
+        println!(
+            "[INTERMEDIATE] Windows: {} | Exposure: {:.1}% (Between {:.1}% and {:.1}%). No state transition.",
+            visible_windows.len(),
+            current_exposure,
+            cfg.obscured_threshold_percent,
+            cfg.exposed_threshold_percent
+        );
     }
 }
 
@@ -423,6 +424,8 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
             );
         }
         *LAST_SHUFFLE_TIME.lock().unwrap() = Some(chrono::Utc::now());
+        // Speculatively pre-compose the next candidate in advance so future reveals are instant
+        ensure_candidate_precomposed_async(cfg, log);
     }
 }
 
@@ -530,6 +533,26 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
             } else {
                 println!(
                     "[READY] SetWinEventHook active (monitoring move, resize, minimize, foreground)."
+                );
+            }
+        }
+
+        // Startup trigger: if desktop is visible on startup/launch, apply initial wallpaper immediately
+        if initial_exposure >= cfg.exposed_threshold_percent {
+            if foreground {
+                println!(
+                    ">>> [STARTUP TRIGGER] Desktop is visible ({:.1}% >= {:.1}%). Applying initial wallpaper...",
+                    initial_exposure, cfg.exposed_threshold_percent
+                );
+            }
+            apply_or_await_wallpaper(&cfg, foreground);
+            WAS_DESKTOP_OBSCURED.store(false, Ordering::SeqCst);
+        } else {
+            WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
+            if foreground {
+                println!(
+                    "[STARTUP ARMED] Desktop is currently covered ({:.1}% < {:.1}%). Armed for first reveal.",
+                    initial_exposure, cfg.exposed_threshold_percent
                 );
             }
         }

@@ -16,8 +16,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             wallpaper_dirs: vec![dirs_wallpaper()],
-            exposed_threshold_percent: 20.0,
-            obscured_threshold_percent: 10.0,
+            exposed_threshold_percent: 15.0,
+            obscured_threshold_percent: 5.0,
             cooldown_seconds: 300,
             debounce_millis: 400,
             history_count: 10,
@@ -29,7 +29,16 @@ impl AppConfig {
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse config JSON: {}", e))
+        let mut cfg: AppConfig = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
+        // Seamlessly migrate legacy defaults (20.0% / 10.0%) to new calibrated thresholds (15.0% / 5.0%)
+        if (cfg.exposed_threshold_percent - 20.0).abs() < f64::EPSILON
+            && (cfg.obscured_threshold_percent - 10.0).abs() < f64::EPSILON
+        {
+            cfg.exposed_threshold_percent = 15.0;
+            cfg.obscured_threshold_percent = 5.0;
+        }
+        Ok(cfg)
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
