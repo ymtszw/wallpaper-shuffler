@@ -413,8 +413,53 @@ impl CollageCardPlacement {
     }
 }
 
-/// Mode B: Large portrait-dominated prints with guaranteed >= 70% unoccluded exposure per image.
-/// Automatically search-adjusts or reduces photo count so no photo is buried.
+fn calculate_canvas_margin_ratio(
+    placements: &[CollageCardPlacement],
+    grid_w: usize,
+    grid_h: usize,
+) -> f32 {
+    let mut covered_count = 0;
+    let total_samples = (grid_w * grid_h) as f32;
+    let step_x = CANVAS_WIDTH_4K as f32 / grid_w as f32;
+    let step_y = CANVAS_HEIGHT_4K as f32 / grid_h as f32;
+
+    for gy in 0..grid_h {
+        let py = gy as f32 * step_y + step_y * 0.5;
+        for gx in 0..grid_w {
+            let px = gx as f32 * step_x + step_x * 0.5;
+            if placements.iter().any(|c| c.contains_point(px, py)) {
+                covered_count += 1;
+            }
+        }
+    }
+
+    1.0 - (covered_count as f32 / total_samples)
+}
+
+fn collect_uncovered_grid_points(
+    placements: &[CollageCardPlacement],
+    grid_w: usize,
+    grid_h: usize,
+) -> Vec<(f32, f32)> {
+    let mut uncovered = Vec::new();
+    let step_x = CANVAS_WIDTH_4K as f32 / grid_w as f32;
+    let step_y = CANVAS_HEIGHT_4K as f32 / grid_h as f32;
+
+    for gy in 0..grid_h {
+        let py = gy as f32 * step_y + step_y * 0.5;
+        for gx in 0..grid_w {
+            let px = gx as f32 * step_x + step_x * 0.5;
+            if !placements.iter().any(|c| c.contains_point(px, py)) {
+                uncovered.push((px, py));
+            }
+        }
+    }
+
+    uncovered
+}
+
+/// Mode B: Large portrait-dominated prints with guaranteed >= 70% unoccluded exposure per primary image.
+/// Uses exploratory placement optimization for 4+ cards and underlay gap-filling for remaining margin.
 pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
     if images.is_empty() {
         return Err("No images provided for collage".to_string());
@@ -430,13 +475,19 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
     for p in &candidate_paths {
         if let Ok(src) = load_rgb_image(p) {
             loaded.push(src);
-            if loaded.len() >= 7 {
+            if loaded.len() >= 10 {
                 break;
             }
         }
     }
     if loaded.is_empty() {
         return Err("Failed to load any valid images for collage".to_string());
+    }
+
+    // Guarantee minimum 4 images for collage composition (cycle if fewer available)
+    while loaded.len() < 4 {
+        let clone_img = loaded[loaded.len() % loaded.len()].clone();
+        loaded.push(clone_img);
     }
 
     let preset = next_rotated_ambient_gradient();
@@ -455,101 +506,195 @@ pub fn compose_collage(images: &[PathBuf]) -> Result<RgbImage, String> {
         FrameStyle::None,
     ];
 
-    // Anchors designed to cover 4K screen with perimeter bleed
-    let anchor_pools = [
-        (650i32, 900i32),   // Left mid
-        (1920i32, 1150i32), // Center Hero
-        (3190i32, 950i32),  // Right mid
-        (1300i32, 450i32),  // Top-mid left (bleeds top)
-        (2540i32, 1700i32), // Bottom-mid right (bleeds bottom)
-        (3650i32, 1550i32), // Far right (bleeds right)
-        (200i32, 1600i32),  // Far left (bleeds left)
-    ];
-
     // Pre-decorate cards once outside search loop to ensure blazing fast performance (<300ms)
     struct PreparedCard {
         card: RgbaImage,
         w: f32,
         h: f32,
-        angle_rad: f32,
     }
 
     let prepared_cards: Vec<PreparedCard> = loaded
         .iter()
-        .take(7)
-        .enumerate()
-        .map(|(i, src)| {
+        .map(|src| {
             let max_dim = rng.gen_range(1450..=1800);
             let scaled = fit_downscale_only(src, max_dim);
             let style = *frame_styles.choose(&mut rng).unwrap();
             let card = decorate_photo_card(&scaled, style);
-            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
-            let angle_deg = sign * rng.gen_range(3.0..9.0);
-            let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
             let w = card.width() as f32;
             let h = card.height() as f32;
-            PreparedCard {
-                card,
-                w,
-                h,
-                angle_rad,
-            }
+            PreparedCard { card, w, h }
         })
         .collect();
 
-    // Target exposure threshold: every placed photo must have >= 70% unoccluded visible area!
+    // 1. Determine primary cards count (enforce minimum 4 images)
+    let primary_count = if prepared_cards.len() >= 5 && rng.gen_bool(0.4) {
+        5
+    } else {
+        4
+    };
+
+    let anchors_4 = [
+        (880i32, 750i32),   // Top-Left
+        (2960i32, 750i32),  // Top-Right
+        (1100i32, 1450i32), // Bottom-Left
+        (2740i32, 1450i32), // Bottom-Right
+    ];
+
+    let anchors_5 = [
+        (800i32, 700i32),   // Top-Left
+        (3040i32, 700i32),  // Top-Right
+        (1920i32, 1100i32), // Center Hero
+        (960i32, 1500i32),  // Bottom-Left
+        (2880i32, 1500i32), // Bottom-Right
+    ];
+
+    let primary_anchors: &[(i32, i32)] = if primary_count == 5 {
+        &anchors_5
+    } else {
+        &anchors_4
+    };
+
+    // 2. Exploratory optimization round for primary 4+ cards:
+    // Minimize mutual overlap (all cards >= 70% visible) while minimizing canvas background margin.
     let min_exposure_threshold = 0.70f32;
-    let mut target_count = prepared_cards.len().clamp(4, 7);
-    let mut final_placements = Vec::new();
+    let mut best_primary_placements = Vec::new();
+    let mut best_margin_ratio = 1.0f32;
+    let mut best_fallback_placements = Vec::new();
+    let mut best_fallback_min_exposure = 0.0f32;
 
-    while target_count >= 3 {
-        let mut found_good_layout = false;
+    for attempt in 0..150 {
+        let mut candidate_placements = Vec::new();
+        for i in 0..primary_count {
+            let prep = &prepared_cards[i];
+            let (base_x, base_y) = primary_anchors[i];
+            let jx = rng.gen_range(-180..=180);
+            let jy = rng.gen_range(-130..=130);
+            let cx = (base_x + jx) as f32;
+            let cy = (base_y + jy) as f32;
 
-        for _attempt in 0..50 {
-            let mut placements = Vec::new();
-            for i in 0..target_count {
-                let prep = &prepared_cards[i];
-                let (base_x, base_y) = anchor_pools[i % anchor_pools.len()];
-                let jx = rng.gen_range(-120..120);
-                let jy = rng.gen_range(-90..90);
+            let sign = if (i + attempt) % 2 == 0 { 1.0 } else { -1.0 };
+            let angle_deg = sign * rng.gen_range(2.0..=8.5);
+            let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
 
-                let cx = (base_x + jx) as f32;
-                let cy = (base_y + jy) as f32;
+            candidate_placements.push(CollageCardPlacement {
+                cx,
+                cy,
+                w: prep.w,
+                h: prep.h,
+                angle_rad,
+            });
+        }
 
-                placements.push(CollageCardPlacement {
+        // Check unoccluded ratio for each card against top cards
+        let mut min_exp = 1.0f32;
+        for idx in 0..candidate_placements.len() {
+            let top_cards = &candidate_placements[idx + 1..];
+            let exp = candidate_placements[idx].calculate_unoccluded_ratio(top_cards);
+            if exp < min_exp {
+                min_exp = exp;
+            }
+        }
+
+        if min_exp >= min_exposure_threshold {
+            let margin = calculate_canvas_margin_ratio(&candidate_placements, 40, 24);
+            if margin < best_margin_ratio {
+                best_margin_ratio = margin;
+                best_primary_placements = candidate_placements;
+            }
+        } else if min_exp > best_fallback_min_exposure {
+            best_fallback_min_exposure = min_exp;
+            best_fallback_placements = candidate_placements;
+        }
+    }
+
+    if best_primary_placements.is_empty() {
+        best_primary_placements = best_fallback_placements;
+        best_margin_ratio = calculate_canvas_margin_ratio(&best_primary_placements, 40, 24);
+    }
+
+    // 3. Exception Rule: Underlay Gap-Filling Round
+    // If canvas background margin remains above ~20% (0.20), pick additional images
+    // and place them underneath the primary cards to cover the margin, requiring >= 10% visible exposure.
+    struct UnderlayCard {
+        card_idx: usize,
+        placement: CollageCardPlacement,
+    }
+
+    let mut underlay_cards: Vec<UnderlayCard> = Vec::new();
+
+    if best_margin_ratio > 0.19 && prepared_cards.len() > primary_count {
+        let mut all_current_placements = best_primary_placements.clone();
+        let max_extra = prepared_cards.len().min(primary_count + 3);
+
+        for (extra_idx, prep) in prepared_cards
+            .iter()
+            .enumerate()
+            .take(max_extra)
+            .skip(primary_count)
+        {
+            let uncovered_points = collect_uncovered_grid_points(&all_current_placements, 40, 24);
+            let current_margin = uncovered_points.len() as f32 / (40.0 * 24.0);
+            if current_margin <= 0.16 || uncovered_points.is_empty() {
+                break;
+            }
+
+            let mut best_cand: Option<CollageCardPlacement> = None;
+            let mut best_covered_new = 0usize;
+
+            // Search best underlay position across clusters of uncovered points
+            for _ in 0..50 {
+                let &(target_x, target_y) = uncovered_points.choose(&mut rng).unwrap();
+                let cx = target_x + rng.gen_range(-90.0..=90.0);
+                let cy = target_y + rng.gen_range(-90.0..=90.0);
+                let angle_deg = rng.gen_range(-8.0..=8.0);
+                let angle_rad = angle_deg * (std::f32::consts::PI / 180.0);
+
+                let cand = CollageCardPlacement {
                     cx,
                     cy,
                     w: prep.w,
                     h: prep.h,
-                    angle_rad: prep.angle_rad,
+                    angle_rad,
+                };
+
+                // Requirement: underlay card must peek out with at least 10% visible area underneath primary cards
+                let visible_ratio = cand.calculate_unoccluded_ratio(&best_primary_placements);
+                if visible_ratio >= 0.10 {
+                    let newly_covered = uncovered_points
+                        .iter()
+                        .filter(|(px, py)| cand.contains_point(*px, *py))
+                        .count();
+                    if newly_covered > best_covered_new {
+                        best_covered_new = newly_covered;
+                        best_cand = Some(cand);
+                    }
+                }
+            }
+
+            if let Some(winning_cand) = best_cand.filter(|_| best_covered_new >= 12) {
+                all_current_placements.push(winning_cand.clone());
+                underlay_cards.push(UnderlayCard {
+                    card_idx: extra_idx,
+                    placement: winning_cand,
                 });
             }
-
-            // Verify visibility threshold for each card
-            let all_satisfy = placements.iter().enumerate().all(|(idx, card)| {
-                let top_cards = &placements[idx + 1..];
-                card.calculate_unoccluded_ratio(top_cards) >= min_exposure_threshold
-            });
-
-            if all_satisfy {
-                final_placements = placements;
-                found_good_layout = true;
-                break;
-            }
         }
-
-        if found_good_layout {
-            break;
-        }
-
-        // If crowded, reduce photo count by 1 and retry
-        target_count -= 1;
     }
 
-    // Render cards onto canvas (rotate only the final winning cards once!)
-    for (i, p) in final_placements.into_iter().enumerate() {
+    // 4. Rendering in proper depth order:
+    // Layer 1: Render Underlay cards FIRST (underneath primary cards)
+    for uc in &underlay_cards {
+        let prep = &prepared_cards[uc.card_idx];
+        let rotated = rotate_rgba(&prep.card, uc.placement.angle_rad);
+        let place_x = (uc.placement.cx - rotated.width() as f32 / 2.0).round() as i32;
+        let place_y = (uc.placement.cy - rotated.height() as f32 / 2.0).round() as i32;
+        blend_tilted_card_with_shadow(&mut canvas, &rotated, place_x, place_y);
+    }
+
+    // Layer 2: Render Primary cards ON TOP (prominent, with shadow onto underlay and canvas)
+    for (i, p) in best_primary_placements.into_iter().enumerate() {
         let prep = &prepared_cards[i];
-        let rotated = rotate_rgba(&prep.card, prep.angle_rad);
+        let rotated = rotate_rgba(&prep.card, p.angle_rad);
         let place_x = (p.cx - rotated.width() as f32 / 2.0).round() as i32;
         let place_y = (p.cy - rotated.height() as f32 / 2.0).round() as i32;
         blend_tilted_card_with_shadow(&mut canvas, &rotated, place_x, place_y);
@@ -902,7 +1047,7 @@ pub fn execute_shuffle_and_compose(
             let img = compose_tiling(&selected)?;
             (CompositionMode::Tiling, img, selected)
         } else {
-            let count = 7.min(images.len());
+            let count = 10.min(images.len());
             let selected: Vec<PathBuf> = images.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (CompositionMode::Collage, img, selected)
@@ -973,7 +1118,7 @@ pub fn execute_mode_explicit(
             (img, vec![single_img.clone()])
         }
         CompositionMode::Collage => {
-            let count = pool.len().min(7);
+            let count = pool.len().min(10);
             let selected: Vec<PathBuf> = pool.iter().take(count).cloned().collect();
             let img = compose_collage(&selected)?;
             (img, selected)
