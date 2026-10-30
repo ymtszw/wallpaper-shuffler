@@ -2,9 +2,10 @@ use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetShellWindow, GetSystemMetrics,
-    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW, WS_VISIBLE,
+    EnumWindows, GW_CHILD, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetDesktopWindow,
+    GetShellWindow, GetSystemMetrics, GetWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
+    IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 use windows::core::BOOL;
 
@@ -53,6 +54,10 @@ pub fn get_virtual_screen_bounds() -> ScreenRect {
 
 pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return false;
+        }
+
         if hwnd == GetShellWindow() {
             return false;
         }
@@ -133,6 +138,28 @@ pub fn collect_visible_window_rects() -> Vec<ScreenRect> {
             Some(enum_proc),
             LPARAM(&mut state as *mut EnumState as isize),
         );
+
+        // Fallback: if EnumWindows returned no windows, walk desktop child hierarchy directly
+        if state.windows.is_empty() {
+            let mut curr = GetWindow(GetDesktopWindow(), GW_CHILD);
+            while let Ok(h) = curr {
+                if h.0.is_null() {
+                    break;
+                }
+                if is_window_valid_and_visible(h) {
+                    let mut rect = RECT::default();
+                    if GetWindowRect(h, &mut rect).is_ok() {
+                        state.windows.push(ScreenRect {
+                            left: rect.left,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        });
+                    }
+                }
+                curr = GetWindow(h, GW_HWNDNEXT);
+            }
+        }
     }
 
     state.windows

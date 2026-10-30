@@ -111,37 +111,45 @@ unsafe extern "system" fn win_event_hook_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
-    _id_object: i32,
+    id_object: i32,
     _id_child: i32,
     _thread: u32,
     _time: u32,
 ) {
     let target = TARGET_HWND.load(Ordering::Relaxed);
-    if target == 0 {
+    if target == 0 || hwnd.0.is_null() {
         return;
     }
 
-    if detector::is_window_valid_and_visible(hwnd) {
-        if FOREGROUND_LOGGING.load(Ordering::Relaxed) {
-            println!(
-                "[EVENT 0x{:04X}] Window activity detected on HWND {:?}. Resetting debounce timer...",
-                event, hwnd.0
-            );
-        }
-
-        let debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed) as u32;
-        unsafe {
-            let _ = SetTimer(
-                Some(HWND(target as *mut _)),
-                TIMER_DEBOUNCE_ID,
-                debounce_ms,
-                None,
-            );
-        }
-
-        let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
-        ensure_candidate_precomposed_async(&cfg, FOREGROUND_LOGGING.load(Ordering::Relaxed));
+    // Only process window-level events (OBJID_WINDOW = 0, OBJID_CLIENT = -4)
+    if id_object != 0 && id_object != -4 {
+        return;
     }
+
+    // Ignore events originating from our own resident daemon window
+    if hwnd.0 == target as *mut _ {
+        return;
+    }
+
+    if FOREGROUND_LOGGING.load(Ordering::Relaxed) {
+        println!(
+            "[EVENT 0x{:04X}] Window activity detected on HWND {:?}. Resetting debounce timer...",
+            event, hwnd.0
+        );
+    }
+
+    let debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed) as u32;
+    unsafe {
+        let _ = SetTimer(
+            Some(HWND(target as *mut _)),
+            TIMER_DEBOUNCE_ID,
+            debounce_ms,
+            None,
+        );
+    }
+
+    let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+    ensure_candidate_precomposed_async(&cfg, FOREGROUND_LOGGING.load(Ordering::Relaxed));
 }
 
 unsafe extern "system" fn window_proc(
@@ -192,6 +200,7 @@ static LAST_SHUFFLE_TIME: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
 static APP_CONFIG: std::sync::Mutex<Option<config::AppConfig>> = std::sync::Mutex::new(None);
 
 fn on_debounce_settled() {
+    let visible_windows = detector::collect_visible_window_rects();
     let current_exposure = detector::calculate_desktop_exposure_rate();
     let is_foreground = FOREGROUND_LOGGING.load(Ordering::Relaxed);
 
@@ -203,7 +212,8 @@ fn on_debounce_settled() {
 
     if is_foreground {
         println!(
-            "[DEBOUNCE SETTLED] Desktop exposure: {:.1}% (Previous: {:.1}%, Thresholds: hidden < {:.1}%, visible >= {:.1}%)",
+            "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%)",
+            visible_windows.len(),
             current_exposure,
             prev_exposure,
             cfg.obscured_threshold_percent,
@@ -406,13 +416,22 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
         let _tray = tray::TrayManager::new(hwnd);
         let _hook_guard = hook::install_window_event_hook(win_event_hook_proc);
 
+        let visible_windows = detector::collect_visible_window_rects();
         let initial_exposure = detector::calculate_desktop_exposure_rate();
         *PREVIOUS_EXPOSURE.lock().unwrap() = Some(initial_exposure);
         if foreground {
             println!(
-                "[INITIAL] Current desktop exposure rate: {:.1}%",
+                "[INITIAL] Recognized {} visible window(s). Desktop exposure rate: {:.1}%",
+                visible_windows.len(),
                 initial_exposure
             );
+            if _hook_guard.is_none() {
+                eprintln!("[ERROR] Failed to install SetWinEventHook! Check privileges.");
+            } else {
+                println!(
+                    "[READY] SetWinEventHook active (monitoring move, resize, minimize, foreground)."
+                );
+            }
         }
 
         let mut msg = MSG::default();
