@@ -322,7 +322,17 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig, log: bool) {
     }
 }
 
-fn run_daemon(foreground: bool) {
+fn get_config_path() -> PathBuf {
+    std::env::var("APPDATA")
+        .map(|p| {
+            PathBuf::from(p)
+                .join("wallpaper-shuffler")
+                .join("config.json")
+        })
+        .unwrap_or_else(|_| PathBuf::from("config.json"))
+}
+
+fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
     if foreground {
         attach_parent_console();
         FOREGROUND_LOGGING.store(true, Ordering::SeqCst);
@@ -333,7 +343,29 @@ fn run_daemon(foreground: bool) {
         println!("Press Ctrl+C to stop.\n");
     }
 
-    let cfg = config::AppConfig::default();
+    let config_path = get_config_path();
+    let mut cfg = config::AppConfig::load_from_file(&config_path).unwrap_or_else(|_| {
+        let default_cfg = config::AppConfig::default();
+        let _ = default_cfg.save_to_file(&config_path);
+        default_cfg
+    });
+
+    if let Some(custom_dir) = override_dir {
+        cfg.wallpaper_dirs = vec![custom_dir];
+    }
+
+    if foreground {
+        println!("Configuration:");
+        println!("  Source directories: {:?}", cfg.wallpaper_dirs);
+        println!("  History directory:  {}", get_history_dir().display());
+        println!(
+            "  Thresholds:         hidden < {:.1}%, exposed >= {:.1}%",
+            cfg.obscured_threshold_percent, cfg.exposed_threshold_percent
+        );
+        println!("  Cooldown:           {} seconds", cfg.cooldown_seconds);
+        println!("  Debounce:           {} ms\n", cfg.debounce_millis);
+    }
+
     LAST_DEBOUNCE_MS.store(cfg.debounce_millis, Ordering::SeqCst);
     *APP_CONFIG.lock().unwrap() = Some(cfg.clone());
 
@@ -414,7 +446,7 @@ fn print_help() {
     );
     println!("Resident Daemon & System Commands:");
     println!(
-        "  --run-foreground                    Run daemon in console with real-time event & trigger logging"
+        "  --run-foreground [DIR]              Run daemon in console with real-time logs (optional: override wallpaper DIR)"
     );
     println!(
         "  --register-startup                  Register application to start automatically on Windows boot"
@@ -736,7 +768,12 @@ fn main() {
                 return;
             }
             "--run-foreground" => {
-                run_daemon(true);
+                let override_dir = if args.len() > 2 {
+                    Some(PathBuf::from(&args[2]))
+                } else {
+                    None
+                };
+                run_daemon(true, override_dir);
                 return;
             }
             "--register-startup" => {
@@ -774,5 +811,5 @@ fn main() {
         }
     }
 
-    run_daemon(false);
+    run_daemon(false, None);
 }
