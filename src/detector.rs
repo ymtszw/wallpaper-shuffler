@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_CHILD, GW_HWNDNEXT, GetDesktopWindow, GetSystemMetrics, GetWindow,
-    GetWindowRect, IsIconic, IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    EnumWindows, GW_CHILD, GW_HWNDNEXT, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetDesktopWindow,
+    GetSystemMetrics, GetWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindow,
+    IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
@@ -60,6 +62,45 @@ pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
             return false;
         }
 
+        // 1. Exclude system background / shell surfaces (Desktop and Taskbars)
+        let mut class_buf = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class_buf) as usize;
+        if len > 0 {
+            let name = String::from_utf16_lossy(&class_buf[..len]);
+            if name == "Progman"
+                || name == "WorkerW"
+                || name == "Shell_TrayWnd"
+                || name == "Shell_SecondaryTrayWnd"
+            {
+                return false;
+            }
+        }
+
+        // 2. Exclude DWM cloaked windows (suspended UWP apps, virtual desktop hidden windows)
+        let mut cloaked: u32 = 0;
+        let hr = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if hr.is_ok() && cloaked != 0 {
+            return false;
+        }
+
+        // 3. Exclude owned utility windows / dialogs unless WS_EX_APPWINDOW is set
+        let owner = GetWindow(hwnd, GW_OWNER).unwrap_or_default();
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+        if (ex_style & WS_EX_TOOLWINDOW.0 != 0) && (ex_style & WS_EX_APPWINDOW.0 == 0) {
+            return false;
+        }
+
+        if !owner.0.is_null() && (ex_style & WS_EX_APPWINDOW.0 == 0) {
+            return false;
+        }
+
+        // 4. Physical dimensions check
         let mut rect = RECT::default();
         if GetWindowRect(hwnd, &mut rect).is_err() {
             return false;
@@ -67,8 +108,8 @@ pub fn is_window_valid_and_visible(hwnd: HWND) -> bool {
 
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
-        // Real interactive windows on desktop have tangible dimensions (>= 120x80)
-        w >= 120 && h >= 80
+        // Real interactive windows on desktop have tangible dimensions (>= 100x100)
+        w >= 100 && h >= 100
     }
 }
 

@@ -10,16 +10,17 @@ mod startup;
 mod tray;
 mod wallpaper;
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, MSG,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect, KillTimer, MSG,
     PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WM_COMMAND, WM_CONTEXTMENU,
     WM_DESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
@@ -31,6 +32,9 @@ static FOREGROUND_LOGGING: AtomicBool = AtomicBool::new(false);
 static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
 static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
     std::sync::Mutex::new(None);
+
+type WindowRectCache = HashMap<isize, (i32, i32, i32, i32)>;
+static LAST_WINDOW_RECTS: std::sync::Mutex<Option<WindowRectCache>> = std::sync::Mutex::new(None);
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
 const TIMER_WATCH_ID: usize = 9002;
@@ -185,14 +189,32 @@ unsafe extern "system" fn win_event_hook_proc(
         return;
     }
 
-    // Only process window-level events (OBJID_WINDOW = 0, OBJID_CLIENT = -4)
-    if id_object != 0 && id_object != -4 {
+    // Only process window-level events (OBJID_WINDOW = 0).
+    // Specifically ignore child/client controls (OBJID_CLIENT = -4, OBJID_CURSOR = -9)
+    // which fire incessantly during mouse hovering or caret motion.
+    if id_object != 0 {
         return;
     }
 
     // Ignore events originating from our own resident daemon window
     if hwnd.0 == target as *mut _ {
         return;
+    }
+
+    // For EVENT_OBJECT_LOCATIONCHANGE (0x800B), verify whether the window bounds actually changed.
+    // Windows accessibility fires LOCATIONCHANGE on mouse cursor movement and internal control updates.
+    if event == 0x800B {
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect).is_ok() } {
+            let current_rect = (rect.left, rect.top, rect.right, rect.bottom);
+            let mut cache_guard = LAST_WINDOW_RECTS.lock().unwrap();
+            let cache = cache_guard.get_or_insert_with(HashMap::new);
+            if cache.get(&(hwnd.0 as isize)) == Some(&current_rect) {
+                // Window position and dimensions have not changed at all (e.g. mouse hover)
+                return;
+            }
+            cache.insert(hwnd.0 as isize, current_rect);
+        }
     }
 
     on_window_activity_detected(&format!("HOOK: {}", event_name(event)));
@@ -450,6 +472,9 @@ fn run_daemon(foreground: bool, override_dir: Option<PathBuf>) {
 
     LAST_DEBOUNCE_MS.store(cfg.debounce_millis, Ordering::SeqCst);
     *APP_CONFIG.lock().unwrap() = Some(cfg.clone());
+
+    // Pre-compose 1 standby wallpaper immediately on daemon startup so the very first trigger is instant (0ms latency)
+    ensure_candidate_precomposed_async(&cfg, foreground);
 
     unsafe {
         let instance = GetModuleHandleW(None).unwrap_or_default();

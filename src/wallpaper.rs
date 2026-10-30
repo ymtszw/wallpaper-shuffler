@@ -1,5 +1,4 @@
 use std::path::Path;
-use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
@@ -7,6 +6,7 @@ use windows::Win32::UI::Shell::{DesktopWallpaper, IDesktopWallpaper};
 use windows::Win32::UI::WindowsAndMessaging::{
     SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SystemParametersInfoW,
 };
+use windows::core::{HSTRING, PCWSTR};
 
 pub fn set_wallpaper(path: &Path) -> Result<(), String> {
     if !path.exists() {
