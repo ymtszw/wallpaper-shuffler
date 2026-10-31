@@ -30,13 +30,34 @@ use windows::core::w;
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_DEBOUNCE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(400);
 static IS_COMPOSING: AtomicBool = AtomicBool::new(false);
+static IS_APPLYING: AtomicBool = AtomicBool::new(false);
 static IS_PAUSED: AtomicBool = AtomicBool::new(false);
 static STANDBY_WALLPAPER: std::sync::Mutex<Option<composer::CompositionResult>> =
     std::sync::Mutex::new(None);
 static WAS_DESKTOP_OBSCURED: AtomicBool = AtomicBool::new(true);
+static PENDING_SYSTEM_TRIGGER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 const TIMER_DEBOUNCE_ID: usize = 9001;
 const TIMER_WATCH_ID: usize = 9002;
+const RESUME_SETTLE_MIN_MS: u64 = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PendingSystemTrigger {
+    None = 0,
+    Startup = 1,
+    PowerResume = 2,
+}
+
+impl PendingSystemTrigger {
+    fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::Startup,
+            2 => Self::PowerResume,
+            _ => Self::None,
+        }
+    }
+}
 
 static LAST_WATCH_STATE: std::sync::Mutex<Option<(usize, f64)>> = std::sync::Mutex::new(None);
 
@@ -55,7 +76,13 @@ fn on_window_activity_detected(source: &str) {
         source
     );
 
-    let debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed) as u32;
+    let base_debounce_ms = LAST_DEBOUNCE_MS.load(Ordering::Relaxed);
+    let pending = PendingSystemTrigger::from_u8(PENDING_SYSTEM_TRIGGER.load(Ordering::Relaxed));
+    let debounce_ms = if pending == PendingSystemTrigger::PowerResume {
+        base_debounce_ms.max(RESUME_SETTLE_MIN_MS) as u32
+    } else {
+        base_debounce_ms as u32
+    };
     unsafe {
         let _ = SetTimer(
             Some(HWND(target as *mut _)),
@@ -63,6 +90,28 @@ fn on_window_activity_detected(source: &str) {
             debounce_ms,
             None,
         );
+    }
+
+    let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+    ensure_candidate_precomposed_async(&cfg);
+}
+
+fn on_power_resume_detected(hwnd: HWND) {
+    if IS_PAUSED.load(Ordering::Relaxed) {
+        log_debug!("[POWER RESUME] System resumed, but auto-shuffle is paused. Ignoring.");
+        return;
+    }
+
+    PENDING_SYSTEM_TRIGGER.store(PendingSystemTrigger::PowerResume as u8, Ordering::SeqCst);
+    let settle_ms = LAST_DEBOUNCE_MS
+        .load(Ordering::Relaxed)
+        .max(RESUME_SETTLE_MIN_MS) as u32;
+    log_info!(
+        "[POWER RESUME] System resumed from sleep/suspend. Checking desktop exposure after {}ms settle...",
+        settle_ms
+    );
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_DEBOUNCE_ID, settle_ms, None);
     }
 
     let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
@@ -216,12 +265,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_POWERBROADCAST => {
             if wparam.0 == PBT_APMRESUMEAUTOMATIC || wparam.0 == PBT_APMRESUMESUSPEND {
-                log_info!(
-                    ">>> [POWER RESUME] System resumed from sleep/suspend. Triggering wallpaper shuffle..."
-                );
-                WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
-                let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
-                apply_or_await_wallpaper(&cfg);
+                on_power_resume_detected(hwnd);
             }
         }
         tray::WM_TRAYICON => {
@@ -325,7 +369,86 @@ static LAST_SHUFFLE_TIME: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
     std::sync::Mutex::new(None);
 static APP_CONFIG: std::sync::Mutex<Option<config::AppConfig>> = std::sync::Mutex::new(None);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExposureDecision {
+    TriggerShuffle {
+        next_was_obscured: bool,
+    },
+    Skip {
+        next_was_obscured: bool,
+        cooldown_blocked: bool,
+    },
+}
+
+fn decide_shuffle_on_exposure(
+    system_trigger: PendingSystemTrigger,
+    current_exposure: f64,
+    was_obscured: bool,
+    cooldown_elapsed: bool,
+    obscured_threshold: f64,
+    exposed_threshold: f64,
+) -> ExposureDecision {
+    match system_trigger {
+        PendingSystemTrigger::Startup | PendingSystemTrigger::PowerResume => {
+            if current_exposure >= exposed_threshold {
+                if cooldown_elapsed {
+                    ExposureDecision::TriggerShuffle {
+                        next_was_obscured: false,
+                    }
+                } else {
+                    ExposureDecision::Skip {
+                        next_was_obscured: was_obscured,
+                        cooldown_blocked: true,
+                    }
+                }
+            } else {
+                // Wallpaper is not exposed (< exposed_threshold): skip shuffle without burning cooldown,
+                // and arm so the next reveal triggers immediately.
+                ExposureDecision::Skip {
+                    next_was_obscured: true,
+                    cooldown_blocked: false,
+                }
+            }
+        }
+        PendingSystemTrigger::None => {
+            if current_exposure < obscured_threshold {
+                ExposureDecision::Skip {
+                    next_was_obscured: true,
+                    cooldown_blocked: false,
+                }
+            } else if current_exposure >= exposed_threshold {
+                if was_obscured {
+                    if cooldown_elapsed {
+                        ExposureDecision::TriggerShuffle {
+                            next_was_obscured: false,
+                        }
+                    } else {
+                        ExposureDecision::Skip {
+                            next_was_obscured: true,
+                            cooldown_blocked: true,
+                        }
+                    }
+                } else {
+                    ExposureDecision::Skip {
+                        next_was_obscured: false,
+                        cooldown_blocked: false,
+                    }
+                }
+            } else {
+                ExposureDecision::Skip {
+                    next_was_obscured: was_obscured,
+                    cooldown_blocked: false,
+                }
+            }
+        }
+    }
+}
+
 fn on_debounce_settled() {
+    let system_trigger = PendingSystemTrigger::from_u8(
+        PENDING_SYSTEM_TRIGGER.swap(PendingSystemTrigger::None as u8, Ordering::SeqCst),
+    );
+
     if IS_PAUSED.load(Ordering::Relaxed) {
         return;
     }
@@ -337,72 +460,150 @@ fn on_debounce_settled() {
     let mut prev_guard = PREVIOUS_EXPOSURE.lock().unwrap();
     let prev_exposure = prev_guard.unwrap_or(current_exposure);
     *prev_guard = Some(current_exposure);
+    drop(prev_guard);
 
     let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
+    let was_obscured = WAS_DESKTOP_OBSCURED.load(Ordering::SeqCst);
+    let last_time = *LAST_SHUFFLE_TIME.lock().unwrap();
+    let effective_cooldown = if is_foreground {
+        5 // Short 5-second cooldown during foreground testing for instant responsive feedback
+    } else {
+        cfg.cooldown_seconds
+    };
+    let cooldown_elapsed = detector::has_cooldown_elapsed(last_time, effective_cooldown);
 
-    // 1. If desktop is obscured (< 5.0%), arm the transition state
-    if current_exposure < cfg.obscured_threshold_percent {
-        WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
-        log_debug!(
-            "[DESKTOP COVERED] Windows: {} | Exposure: {:.1}% (< {:.1}% threshold). Armed for next reveal!",
-            visible_windows.len(),
-            current_exposure,
-            cfg.obscured_threshold_percent
-        );
-        return;
-    }
+    let decision = decide_shuffle_on_exposure(
+        system_trigger,
+        current_exposure,
+        was_obscured,
+        cooldown_elapsed,
+        cfg.obscured_threshold_percent,
+        cfg.exposed_threshold_percent,
+    );
 
-    // 2. If desktop is exposed (>= 15.0%)
-    if current_exposure >= cfg.exposed_threshold_percent {
-        let was_obscured = WAS_DESKTOP_OBSCURED.load(Ordering::SeqCst);
-        log_debug!(
-            "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%, Armed: {})",
-            visible_windows.len(),
-            current_exposure,
-            prev_exposure,
-            cfg.obscured_threshold_percent,
-            cfg.exposed_threshold_percent,
-            was_obscured
-        );
-
-        if was_obscured {
-            let last_time = *LAST_SHUFFLE_TIME.lock().unwrap();
-            let effective_cooldown = if is_foreground {
-                5 // Short 5-second cooldown during foreground testing for instant responsive feedback
-            } else {
-                cfg.cooldown_seconds
-            };
-
-            if detector::has_cooldown_elapsed(last_time, effective_cooldown) {
+    match (system_trigger, decision) {
+        (PendingSystemTrigger::Startup, ExposureDecision::TriggerShuffle { next_was_obscured }) => {
+            WAS_DESKTOP_OBSCURED.store(next_was_obscured, Ordering::SeqCst);
+            log_info!(
+                ">>> [TRIGGER: STARTUP] Desktop is exposed ({:.1}% >= {:.1}%). Applying initial wallpaper...",
+                current_exposure,
+                cfg.exposed_threshold_percent
+            );
+            apply_or_await_wallpaper(&cfg);
+        }
+        (
+            PendingSystemTrigger::Startup,
+            ExposureDecision::Skip {
+                next_was_obscured,
+                cooldown_blocked,
+            },
+        ) => {
+            WAS_DESKTOP_OBSCURED.store(next_was_obscured, Ordering::SeqCst);
+            if cooldown_blocked {
                 log_info!(
-                    ">>> [TRIGGER: REVEAL] Desktop transitioned from covered to exposed ({:.1}% >= {:.1}%)! Applying wallpaper...",
+                    "[STARTUP COOLDOWN] Desktop is exposed ({:.1}%), but cooldown ({}s) is active. Skipping shuffle.",
+                    current_exposure,
+                    effective_cooldown
+                );
+            } else {
+                log_info!(
+                    "[STARTUP ARMED] Desktop is covered ({:.1}% < {:.1}%). Skipping shuffle; armed for first reveal.",
                     current_exposure,
                     cfg.exposed_threshold_percent
                 );
-                apply_or_await_wallpaper(&cfg);
-                WAS_DESKTOP_OBSCURED.store(false, Ordering::SeqCst);
-            } else {
-                log_debug!(
-                    "[COOLDOWN] Window settled & desktop exposed, but cooldown ({}s) has not elapsed yet. Standby candidate preserved.",
+            }
+        }
+        (
+            PendingSystemTrigger::PowerResume,
+            ExposureDecision::TriggerShuffle { next_was_obscured },
+        ) => {
+            WAS_DESKTOP_OBSCURED.store(next_was_obscured, Ordering::SeqCst);
+            log_info!(
+                ">>> [TRIGGER: POWER RESUME] Desktop is exposed ({:.1}% >= {:.1}%) after resume! Applying wallpaper...",
+                current_exposure,
+                cfg.exposed_threshold_percent
+            );
+            apply_or_await_wallpaper(&cfg);
+        }
+        (
+            PendingSystemTrigger::PowerResume,
+            ExposureDecision::Skip {
+                next_was_obscured,
+                cooldown_blocked,
+            },
+        ) => {
+            WAS_DESKTOP_OBSCURED.store(next_was_obscured, Ordering::SeqCst);
+            if cooldown_blocked {
+                log_info!(
+                    "[POWER RESUME COOLDOWN] Desktop is exposed ({:.1}%), but cooldown ({}s) is active. Skipping shuffle.",
+                    current_exposure,
                     effective_cooldown
                 );
+            } else {
+                log_info!(
+                    "[POWER RESUME ARMED] Desktop is covered ({:.1}% < {:.1}%). Skipping shuffle; armed for next reveal (cooldown preserved).",
+                    current_exposure,
+                    cfg.exposed_threshold_percent
+                );
             }
-        } else {
-            log_debug!(
-                "[EXPOSED (NO TRIGGER)] Desktop remains exposed ({:.1}% >= {:.1}%). Skipping shuffle (waiting for desktop to be covered < {:.1}% first).",
-                current_exposure,
-                cfg.exposed_threshold_percent,
-                cfg.obscured_threshold_percent
-            );
         }
-    } else {
-        log_debug!(
-            "[INTERMEDIATE] Windows: {} | Exposure: {:.1}% (Between {:.1}% and {:.1}%). No state transition.",
-            visible_windows.len(),
-            current_exposure,
-            cfg.obscured_threshold_percent,
-            cfg.exposed_threshold_percent
-        );
+        (PendingSystemTrigger::None, ExposureDecision::TriggerShuffle { next_was_obscured }) => {
+            log_debug!(
+                "[DEBOUNCE SETTLED] Windows: {} | Exposure: {:.1}% (Prev: {:.1}%, Target: hidden < {:.1}%, exposed >= {:.1}%, Armed: {})",
+                visible_windows.len(),
+                current_exposure,
+                prev_exposure,
+                cfg.obscured_threshold_percent,
+                cfg.exposed_threshold_percent,
+                was_obscured
+            );
+            WAS_DESKTOP_OBSCURED.store(next_was_obscured, Ordering::SeqCst);
+            log_info!(
+                ">>> [TRIGGER: REVEAL] Desktop transitioned from covered to exposed ({:.1}% >= {:.1}%)! Applying wallpaper...",
+                current_exposure,
+                cfg.exposed_threshold_percent
+            );
+            apply_or_await_wallpaper(&cfg);
+        }
+        (
+            PendingSystemTrigger::None,
+            ExposureDecision::Skip {
+                next_was_obscured,
+                cooldown_blocked,
+            },
+        ) => {
+            WAS_DESKTOP_OBSCURED.store(next_was_obscured, Ordering::SeqCst);
+            if current_exposure < cfg.obscured_threshold_percent {
+                log_debug!(
+                    "[DESKTOP COVERED] Windows: {} | Exposure: {:.1}% (< {:.1}% threshold). Armed for next reveal!",
+                    visible_windows.len(),
+                    current_exposure,
+                    cfg.obscured_threshold_percent
+                );
+            } else if current_exposure >= cfg.exposed_threshold_percent {
+                if cooldown_blocked {
+                    log_debug!(
+                        "[COOLDOWN] Window settled & desktop exposed, but cooldown ({}s) has not elapsed yet. Standby candidate preserved.",
+                        effective_cooldown
+                    );
+                } else {
+                    log_debug!(
+                        "[EXPOSED (NO TRIGGER)] Desktop remains exposed ({:.1}% >= {:.1}%). Skipping shuffle (waiting for desktop to be covered < {:.1}% first).",
+                        current_exposure,
+                        cfg.exposed_threshold_percent,
+                        cfg.obscured_threshold_percent
+                    );
+                }
+            } else {
+                log_debug!(
+                    "[INTERMEDIATE] Windows: {} | Exposure: {:.1}% (Between {:.1}% and {:.1}%). No state transition.",
+                    visible_windows.len(),
+                    current_exposure,
+                    cfg.obscured_threshold_percent,
+                    cfg.exposed_threshold_percent
+                );
+            }
+        }
     }
 }
 
@@ -412,7 +613,26 @@ fn trigger_manual_shuffle() {
     apply_or_await_wallpaper(&cfg);
 }
 
+struct ApplyingGuard;
+
+impl Drop for ApplyingGuard {
+    fn drop(&mut self) {
+        IS_APPLYING.store(false, Ordering::SeqCst);
+    }
+}
+
 fn apply_or_await_wallpaper(cfg: &config::AppConfig) {
+    if IS_APPLYING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        log_debug!(
+            "[SKIP REENTRANT] Wallpaper application already in progress. Skipping concurrent apply."
+        );
+        return;
+    }
+    let _apply_guard = ApplyingGuard;
+
     // 1. Take candidate from standby cache if ready
     let mut candidate = STANDBY_WALLPAPER.lock().unwrap().take();
 
@@ -640,6 +860,7 @@ fn run_daemon(
         let visible_windows = detector::collect_visible_window_rects();
         let initial_exposure = detector::calculate_desktop_exposure_rate();
         *PREVIOUS_EXPOSURE.lock().unwrap() = Some(initial_exposure);
+        *LAST_WATCH_STATE.lock().unwrap() = Some((visible_windows.len(), initial_exposure));
 
         log_info!(
             "[INITIAL] Recognized {} visible window(s). Desktop exposure rate: {:.1}%",
@@ -654,23 +875,15 @@ fn run_daemon(
             );
         }
 
-        // Startup trigger: if desktop is visible on startup/launch, apply initial wallpaper immediately
-        if initial_exposure >= cfg.exposed_threshold_percent {
-            log_info!(
-                ">>> [STARTUP TRIGGER] Desktop is visible ({:.1}% >= {:.1}%). Applying initial wallpaper...",
-                initial_exposure,
-                cfg.exposed_threshold_percent
-            );
-            apply_or_await_wallpaper(&cfg);
-            WAS_DESKTOP_OBSCURED.store(false, Ordering::SeqCst);
-        } else {
-            WAS_DESKTOP_OBSCURED.store(true, Ordering::SeqCst);
-            log_info!(
-                "[STARTUP ARMED] Desktop is currently covered ({:.1}% < {:.1}%). Armed for first reveal.",
-                initial_exposure,
-                cfg.exposed_threshold_percent
-            );
-        }
+        // Schedule initial startup check through debounce timer so startup windows can settle
+        // and exposure is verified before deciding whether to shuffle.
+        PENDING_SYSTEM_TRIGGER.store(PendingSystemTrigger::Startup as u8, Ordering::SeqCst);
+        let startup_settle_ms = cfg.debounce_millis.max(50) as u32;
+        log_info!(
+            "[STARTUP] Scheduling initial desktop exposure check after {}ms settle...",
+            startup_settle_ms
+        );
+        let _ = SetTimer(Some(hwnd), TIMER_DEBOUNCE_ID, startup_settle_ms, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -1088,4 +1301,150 @@ fn main() {
     }
 
     run_daemon(false, None, None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resume_skips_when_covered_and_arms_for_next_reveal() {
+        // Fully covered (0.0% < 15.0%): must NOT shuffle, must arm was_obscured = true
+        let dec_zero = decide_shuffle_on_exposure(
+            PendingSystemTrigger::PowerResume,
+            0.0,
+            false,
+            true,
+            5.0,
+            15.0,
+        );
+        assert_eq!(
+            dec_zero,
+            ExposureDecision::Skip {
+                next_was_obscured: true,
+                cooldown_blocked: false,
+            }
+        );
+
+        // Intermediate coverage (10.0% < 15.0%): still not exposed, must NOT shuffle, must arm
+        let dec_mid = decide_shuffle_on_exposure(
+            PendingSystemTrigger::PowerResume,
+            10.0,
+            false,
+            true,
+            5.0,
+            15.0,
+        );
+        assert_eq!(
+            dec_mid,
+            ExposureDecision::Skip {
+                next_was_obscured: true,
+                cooldown_blocked: false,
+            }
+        );
+
+        // Subsequent reveal (25.0% >= 15.0%) immediately triggers since cooldown was preserved!
+        let dec_reveal =
+            decide_shuffle_on_exposure(PendingSystemTrigger::None, 25.0, true, true, 5.0, 15.0);
+        assert_eq!(
+            dec_reveal,
+            ExposureDecision::TriggerShuffle {
+                next_was_obscured: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resume_triggers_when_exposed_and_deduplicates_within_cooldown() {
+        // Desktop exposed on resume (60.0% >= 15.0%) with cooldown elapsed -> triggers shuffle
+        let first = decide_shuffle_on_exposure(
+            PendingSystemTrigger::PowerResume,
+            60.0,
+            false,
+            true,
+            5.0,
+            15.0,
+        );
+        assert_eq!(
+            first,
+            ExposureDecision::TriggerShuffle {
+                next_was_obscured: false,
+            }
+        );
+
+        // Second PBT_APMRESUMESUSPEND arriving right after shuffle (cooldown_elapsed = false, was_obscured = false)
+        // must skip and must NOT re-arm was_obscured!
+        let second = decide_shuffle_on_exposure(
+            PendingSystemTrigger::PowerResume,
+            60.0,
+            false,
+            false,
+            5.0,
+            15.0,
+        );
+        assert_eq!(
+            second,
+            ExposureDecision::Skip {
+                next_was_obscured: false,
+                cooldown_blocked: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_startup_checks_exposure_before_shuffling() {
+        // Covered on startup -> skip and arm
+        assert_eq!(
+            decide_shuffle_on_exposure(PendingSystemTrigger::Startup, 3.7, true, true, 5.0, 15.0),
+            ExposureDecision::Skip {
+                next_was_obscured: true,
+                cooldown_blocked: false,
+            }
+        );
+
+        // Exposed on startup -> trigger shuffle and disarm
+        assert_eq!(
+            decide_shuffle_on_exposure(PendingSystemTrigger::Startup, 40.0, true, true, 5.0, 15.0),
+            ExposureDecision::TriggerShuffle {
+                next_was_obscured: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_normal_hysteresis_transition() {
+        // Covered (< 5%) -> arms
+        assert_eq!(
+            decide_shuffle_on_exposure(PendingSystemTrigger::None, 2.0, false, true, 5.0, 15.0),
+            ExposureDecision::Skip {
+                next_was_obscured: true,
+                cooldown_blocked: false,
+            }
+        );
+
+        // Intermediate (10%) preserves existing armed state
+        assert_eq!(
+            decide_shuffle_on_exposure(PendingSystemTrigger::None, 10.0, false, true, 5.0, 15.0),
+            ExposureDecision::Skip {
+                next_was_obscured: false,
+                cooldown_blocked: false,
+            }
+        );
+        assert_eq!(
+            decide_shuffle_on_exposure(PendingSystemTrigger::None, 10.0, true, true, 5.0, 15.0),
+            ExposureDecision::Skip {
+                next_was_obscured: true,
+                cooldown_blocked: false,
+            }
+        );
+
+        // Exposed (>= 15%) while disarmed -> skip
+        assert_eq!(
+            decide_shuffle_on_exposure(PendingSystemTrigger::None, 30.0, false, true, 5.0, 15.0),
+            ExposureDecision::Skip {
+                next_was_obscured: false,
+                cooldown_blocked: false,
+            }
+        );
+    }
 }
