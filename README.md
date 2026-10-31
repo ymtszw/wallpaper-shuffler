@@ -1,82 +1,53 @@
 # wallpaper-shuffler
 
-Ultra-lightweight, event-driven Windows resident background daemon that intelligently shuffles wallpapers when your desktop is actually revealed.
+A small resident Windows program that shuffles desktop wallpapers when the desktop becomes visible.
 
-Designed for 4K displays and heavy multi-window multitasking where wallpapers are hidden behind windows most of the day.
+## Background
 
----
+On a 4K display with multiple windows tiled across the screen, the wallpaper is hidden most of the day. Fixed-interval wallpaper changers keep rotating images while nobody can see them, and typical image folders mix wide landscapes with portrait illustrations or smaller images that do not fit a 16:9 screen cleanly on their own.
+
+`wallpaper-shuffler` was built around three practical goals:
+
+- **Shuffle on desktop reveal**: Uses Win32 window event hooks (`SetWinEventHook`) with debounce and a cooldown timer. It stays idle while windows cover the screen and switches the wallpaper when minimizing or closing windows (including `Win + D`), boot, or wake-from-sleep leaves the desktop exposed.
+- **Layout by image dimensions**: Landscape images wide enough for a desktop (`>= 1900px`) are fitted as a single 4K wallpaper. Portrait or smaller images are combined onto a 4K (`3840x2160`) pastel backdrop as either a multi-card collage or a tiled layout without cropping the source images. Recent outputs are saved to a local history folder.
+- **Minimal startup footprint**: Written in Rust with `windows-rs` as a single standalone `.exe` with no runtime or garbage collector, intended to stay registered in Windows startup.
 
 ## Features
 
-- **Desktop Exposure Trigger**: Automatically detects when your desktop transitions from covered (<5% exposed) to visible (>=15% exposed), such as upon minimizing windows or pressing <kbd>Win</kbd> + <kbd>D</kbd>.
-- **Exposure-Aware Startup & Sleep Resume**: Checks desktop visibility after startup or wake-from-sleep windows settle—shuffling when your desktop is visible, and preserving cooldown when covered behind maximized windows.
-- **Event-Driven & 0% CPU Idle**: Listens to native OS window events via Win32 `SetWinEventHook` with speculative background pre-composition for instant (zero-wait) wallpaper switching.
-- **Smart 4K Composition Engine**:
-  - **Single 2K+ Fit**: Strictly landscape images ($\ge 1900\text{px}$) are center-fit to 4K (3840x2160) preserving aspect ratio. Portrait photos are never trimmed or forced.
-  - **Large-Print Collage**: 5–6 primary framed cards ($\ge 70\%$ visible each) with underlay gap-fillers scattered across 4K at gentle organic tilts, smooth sub-pixel anti-aliased edges, and soft drop shadows.
-  - **Dynamic Irregular Tiling**: Lower-center anchored placement with natural jitter, uniform 30px gaps, and strict duplicate-free image selection.
-  - **5-Color Rotating Pastel Ambient Backdrops**: Cycles through soft tints (Lavender, Sakura Blossom, Sunset Apricot, Sky Mist, Sage Mint) with subtle spatial gradients behind photos.
-  - **Broad Format Support**: Seamlessly reads `.jpg`, `.jpeg`, `.jfif`, `.jiff`, `.png`, and `.webp`.
-- **Rich System Tray & Startup Integration**:
-  - Dynamic 32x32 framed miniature icon displaying the currently applied wallpaper.
-  - Right-click menu to **Shuffle Now**, **Pause/Resume**, inspect **Current Settings & Status**, **Edit / Reload `config.json`**, open **Wallpapers / Logs** folders, toggle **Start with Windows**, or switch **Log Level** on the fly.
-- **Persistent Headless Logging & Rotation**: Daily log files (`wallpaper-shuffler_YYYY-MM-DD.log`) stored in `%USERPROFILE%\.wallpaper-shuffler\logs\` with automatic 7-day cleanup.
-- **Minimal Footprint**: Native Rust binary with single `.exe` deployment and zero runtime dependencies.
+- **Exposure-based trigger**: Triggers when visible desktop area transitions from covered (`< 5%`) to exposed (`>= 15%`), after window operations settle (`400ms` default debounce) and cooldown (`300s` default) has elapsed.
+- **Three 4K output modes**:
+  - **Single**: Center-fit for landscape images (`width > height`, `width >= 1900px`).
+  - **Collage**: 5–6 framed cards with underlay gap-fillers rotated at slight angles.
+  - **Tiling**: Uncropped images packed outward with uniform `30px` gaps.
+  - **Supported formats**: `.jpg`, `.jpeg`, `.jfif`, `.jiff`, `.png`, `.webp`.
+- **Background pre-generation**: Pre-composes the next candidate image in a background thread so switching on desktop reveal does not stall.
+- **System tray controls**: Shows a miniature of the current wallpaper in the tray, with right-click actions to shuffle manually, pause/resume, view or reload `config.json`, open wallpaper/log folders, toggle Windows startup, and change log verbosity.
+- **Daily logs**: Writes logs to `%USERPROFILE%\.wallpaper-shuffler\logs\` and deletes files older than 7 days.
 
----
+## Usage
 
-## Quick Start
+To keep maintenance overhead low, prebuilt release binaries and installers are not distributed. Building from source requires Windows 10/11 and a Rust toolchain.
 
-### Installation & Run
+### Setup with an AI Coding Agent
 
-1. Download or build `wallpaper-shuffler.exe`.
-2. Place candidate wallpaper images in your configured wallpaper folder (default: `%USERPROFILE%\Pictures\Wallpapers`), or edit `config.json` from the tray menu.
-3. Launch `wallpaper-shuffler.exe`:
-   - Runs silently in the system tray.
-   - Right-click the framed tray icon to shuffle manually, pause auto-detection, reload configuration, or enable **Start with Windows**.
+Because build and operational details are documented in [`AGENTS.md`](AGENTS.md), you can hand this repository to your coding agent (Antigravity, Claude Code, Codex, Cursor, etc.) and ask it to clone the repo, run a release build, point `wallpaper_dirs` in `%USERPROFILE%\.wallpaper-shuffler\config.json` to your image folder, and register Windows startup.
 
-### Auto-start on Boot (CLI)
-
-You can toggle startup directly from the tray menu (**Start with Windows**), or via CLI:
+### Manual Build & Setup
 
 ```powershell
-wallpaper-shuffler.exe --register-startup
-wallpaper-shuffler.exe --unregister-startup
+cargo build --release
+
+# Launch resident tray app (creates default config on first run)
+.\target\release\wallpaper-shuffler.exe
+
+# Optional: register or remove Windows startup entry
+.\target\release\wallpaper-shuffler.exe --register-startup
+.\target\release\wallpaper-shuffler.exe --unregister-startup
 ```
-
----
-
-## Testing & Image Generation Commands
-
-You can generate synthetic test images, preview composition modes, or benchmark performance on any directory without changing your Windows wallpaper:
-
-```powershell
-# Generate 30 synthetic 2K-4K test images (default: tests/fixtures/images)
-wallpaper-shuffler.exe --generate-fixtures [OUT_DIR]
-
-# Generate all 3 sample styles (Single, Collage, Tiling) with random sampling
-wallpaper-shuffler.exe --test-compose <IMAGE_DIR> [OUT_DIR]
-
-# Test the full auto-shuffle selection & history pipeline without changing OS wallpaper
-wallpaper-shuffler.exe --shuffle-dry-run <IMAGE_DIR> [OUT_DIR]
-
-# Generate a specific style directly
-wallpaper-shuffler.exe --compose-collage <IMAGE_DIR> [OUT_FILE]
-wallpaper-shuffler.exe --compose-tiling  <IMAGE_DIR> [OUT_FILE]
-wallpaper-shuffler.exe --compose-single  <IMAGE_DIR_OR_FILE> [OUT_FILE]
-
-# Measure composition speeds across all 3 modes
-wallpaper-shuffler.exe --benchmark <IMAGE_DIR>
-
-# Run resident daemon in foreground console with real-time exposure & trigger logs
-wallpaper-shuffler.exe --run-foreground [IMAGE_DIR] [--debug | --log-level <debug|info|warn|error>]
-```
-
----
 
 ## Configuration
 
-Settings are saved in `%USERPROFILE%\.wallpaper-shuffler\config.json` (editable via the tray menu's **Edit Settings** + **Reload Configuration**):
+Stored at `%USERPROFILE%\.wallpaper-shuffler\config.json` (editable and reloadable from the tray menu):
 
 ```json
 {
@@ -92,23 +63,17 @@ Settings are saved in `%USERPROFILE%\.wallpaper-shuffler\config.json` (editable 
 }
 ```
 
-Logs are stored in `%USERPROFILE%\.wallpaper-shuffler\logs\wallpaper-shuffler_YYYY-MM-DD.log` and automatically pruned after 7 days.
+Generated wallpapers are kept in `%USERPROFILE%\.wallpaper-shuffler\history\`.
 
----
-
-## Build from Source
-
-Requirements:
-- Windows 10 / 11
-- Rust toolchain (`stable-x86_64-pc-windows-gnu` or `stable-x86_64-pc-windows-msvc`)
+## CLI Commands (Testing & Diagnostics)
 
 ```powershell
-cargo build --release
+wallpaper-shuffler.exe --generate-fixtures [OUT_DIR]        # Generate synthetic test images
+wallpaper-shuffler.exe --test-compose <IMAGE_DIR> [OUT_DIR] # Render Single, Collage, and Tiling samples
+wallpaper-shuffler.exe --shuffle-dry-run <IMAGE_DIR> [OUT_DIR]
+wallpaper-shuffler.exe --run-foreground [IMAGE_DIR] [--debug]
+wallpaper-shuffler.exe --help
 ```
-
-The compiled binary will be placed at `target\release\wallpaper-shuffler.exe`.
-
----
 
 ## License
 
