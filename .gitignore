@@ -3,5 +3,7 @@ tests/fixtures/images/
 target/test_output/
 **/*.rs.bk
 *.pdb
+*.log
+config.json
 .env
 .env.local
