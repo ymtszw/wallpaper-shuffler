@@ -8,6 +8,7 @@ mod fixtures;
 mod hook;
 mod logger;
 mod startup;
+mod taskbar;
 mod tray;
 mod wallpaper;
 
@@ -237,6 +238,10 @@ unsafe extern "system" fn win_event_hook_proc(
         return;
     }
 
+    if event == 0x0003 && taskbar::is_taskbar_active() {
+        taskbar::restore_taskbar_z_order();
+    }
+
     on_window_activity_detected(&format!("HOOK: {}", event_name(event)));
 }
 
@@ -260,6 +265,7 @@ unsafe extern "system" fn window_proc(
                 return LRESULT(0);
             } else if wparam.0 == TIMER_WATCH_ID {
                 check_window_watch();
+                taskbar::tick_taskbar();
                 return LRESULT(0);
             }
         }
@@ -291,6 +297,7 @@ unsafe extern "system" fn window_proc(
                     log_info!("Auto-shuffle resumed by user via tray menu.");
                     tray::update_tray_tooltip("Wallpaper Shuffler");
                 }
+                taskbar::set_taskbar_paused(now_paused);
             }
             tray::IDM_SETTINGS_INFO => {
                 let cfg = APP_CONFIG.lock().unwrap().clone().unwrap_or_default();
@@ -309,6 +316,7 @@ unsafe extern "system" fn window_proc(
                         logger::set_log_level(new_log_level);
                         LAST_DEBOUNCE_MS.store(new_cfg.debounce_millis, Ordering::SeqCst);
                         *APP_CONFIG.lock().unwrap() = Some(new_cfg.clone());
+                        apply_display_mode(new_cfg.display_mode);
                         log_info!(
                             "Configuration reloaded from {}: {:?}",
                             config_path.display(),
@@ -348,12 +356,16 @@ unsafe extern "system" fn window_proc(
             tray::IDM_LOG_WARN => update_active_log_level(LogLevel::Warn),
             tray::IDM_LOG_ERROR => update_active_log_level(LogLevel::Error),
             tray::IDM_LOG_OFF => update_active_log_level(LogLevel::Off),
+            tray::IDM_MODE_TRAY => update_display_mode(config::DisplayMode::Tray),
+            tray::IDM_MODE_TASKBAR => update_display_mode(config::DisplayMode::Taskbar),
             tray::IDM_EXIT => unsafe {
+                taskbar::destroy_taskbar();
                 PostQuitMessage(0);
             },
             _ => {}
         },
         WM_DESTROY => {
+            taskbar::destroy_taskbar();
             unsafe {
                 PostQuitMessage(0);
             }
@@ -696,11 +708,46 @@ fn apply_or_await_wallpaper(cfg: &config::AppConfig) {
             candidate.source_images.len()
         );
         *LAST_SHUFFLE_TIME.lock().unwrap() = Some(chrono::Utc::now());
-        // Update tray icon with framed miniature of the newly applied wallpaper
-        tray::update_tray_icon_from_file(&candidate.output_path);
+        // Update tray icon and taskbar mini UI with the newly applied wallpaper
+        if let Ok(img) = image::open(&candidate.output_path) {
+            let rgba = img.to_rgba8();
+            tray::update_tray_icon(Some(&rgba));
+            taskbar::update_taskbar_wallpaper(Some(&rgba));
+        }
         tray::update_tray_tooltip(&format!("Wallpaper Shuffler ({:?})", candidate.mode));
+        taskbar::set_taskbar_status(&format!("{:?}", candidate.mode));
         // Speculatively pre-compose the next candidate in advance so future reveals are instant
         ensure_candidate_precomposed_async(cfg);
+    }
+}
+
+fn apply_display_mode(mode: config::DisplayMode) {
+    match mode {
+        config::DisplayMode::Taskbar => {
+            if taskbar::set_taskbar_visible(true) {
+                tray::set_tray_visible(false);
+            } else {
+                log_warn!(
+                    "Taskbar Mini UI unavailable (e.g., vertical taskbar); falling back to tray icon."
+                );
+                tray::set_tray_visible(true);
+            }
+        }
+        config::DisplayMode::Tray => {
+            let _ = taskbar::set_taskbar_visible(false);
+            tray::set_tray_visible(true);
+        }
+    }
+}
+
+fn update_display_mode(mode: config::DisplayMode) {
+    log_info!("Display mode changed to {:?}", mode);
+    apply_display_mode(mode);
+    let config_path = get_config_path();
+    let mut guard = APP_CONFIG.lock().unwrap();
+    if let Some(cfg) = guard.as_mut() {
+        cfg.display_mode = mode;
+        let _ = cfg.save_to_file(&config_path);
     }
 }
 
@@ -851,7 +898,10 @@ fn run_daemon(
         } else {
             None
         };
-        tray::init_tray(hwnd, initial_thumb.as_ref());
+        let show_tray_initially = cfg.display_mode == config::DisplayMode::Tray;
+        tray::init_tray(hwnd, initial_thumb.as_ref(), show_tray_initially);
+        taskbar::init_taskbar(hwnd, initial_thumb.as_ref());
+        apply_display_mode(cfg.display_mode);
         let _hook_guard = hook::install_window_event_hook(win_event_hook_proc);
 
         // Start lightweight safety watch timer (250ms) to guarantee 100% window tracking reliability

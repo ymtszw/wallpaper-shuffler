@@ -2,6 +2,30 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    #[default]
+    Tray,
+    Taskbar,
+}
+
+impl DisplayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tray => "tray",
+            Self::Taskbar => "taskbar",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tray => "Tray Icon",
+            Self::Taskbar => "Taskbar Mini UI",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub wallpaper_dirs: Vec<PathBuf>,
@@ -12,6 +36,8 @@ pub struct AppConfig {
     pub history_count: usize,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default)]
+    pub display_mode: DisplayMode,
 }
 
 fn default_log_level() -> String {
@@ -28,6 +54,7 @@ impl Default for AppConfig {
             debounce_millis: 400,
             history_count: 10,
             log_level: default_log_level(),
+            display_mode: DisplayMode::default(),
         }
     }
 }
@@ -80,5 +107,20 @@ mod tests {
             parsed.exposed_threshold_percent
         );
         assert_eq!(cfg.history_count, parsed.history_count);
+        assert_eq!(cfg.display_mode, parsed.display_mode);
+    }
+
+    #[test]
+    fn test_legacy_config_without_display_mode() {
+        let json = r#"{
+            "wallpaper_dirs": ["C:\\Wallpapers"],
+            "exposed_threshold_percent": 15.0,
+            "obscured_threshold_percent": 5.0,
+            "cooldown_seconds": 300,
+            "debounce_millis": 400,
+            "history_count": 10
+        }"#;
+        let parsed: AppConfig = serde_json::from_str(json).expect("deserialize legacy");
+        assert_eq!(parsed.display_mode, DisplayMode::Tray);
     }
 }

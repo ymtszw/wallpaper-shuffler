@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DisplayMode};
 use crate::logger::LogLevel;
 use crate::startup;
 use std::os::windows::ffi::OsStrExt;
@@ -38,6 +38,9 @@ pub const IDM_LOG_OFF: usize = 2014;
 pub const IDM_STATUS_FOLDER: usize = 2020;
 pub const IDM_STATUS_THRESHOLDS: usize = 2021;
 pub const IDM_STATUS_COOLDOWN: usize = 2022;
+
+pub const IDM_MODE_TRAY: usize = 2030;
+pub const IDM_MODE_TASKBAR: usize = 2031;
 
 pub const IDM_EXIT: usize = 2099;
 
@@ -242,13 +245,14 @@ pub struct TrayManager {
     pub hwnd: HWND,
     nid: NOTIFYICONDATAW,
     current_hicon: Option<HICON>,
+    visible: bool,
 }
 
 unsafe impl Send for TrayManager {}
 unsafe impl Sync for TrayManager {}
 
 impl TrayManager {
-    pub fn new(hwnd: HWND, initial_image: Option<&image::RgbaImage>) -> Self {
+    pub fn new(hwnd: HWND, initial_image: Option<&image::RgbaImage>, visible: bool) -> Self {
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
@@ -271,14 +275,38 @@ impl TrayManager {
             nid.hIcon = hicon;
         }
 
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        if visible {
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+            }
         }
 
         Self {
             hwnd,
             nid,
             current_hicon: hicon_opt,
+            visible,
+        }
+    }
+
+    pub fn set_visible(&mut self, show: bool) {
+        if self.visible == show {
+            return;
+        }
+        self.visible = show;
+        if show {
+            self.nid.uFlags = NIF_MESSAGE | NIF_TIP;
+            if let Some(hicon) = self.current_hicon {
+                self.nid.uFlags |= NIF_ICON;
+                self.nid.hIcon = hicon;
+            }
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_ADD, &self.nid);
+            }
+        } else {
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
+            }
         }
     }
 
@@ -287,8 +315,10 @@ impl TrayManager {
         if let Ok(new_hicon) = rgba_to_hicon(&framed_img) {
             self.nid.uFlags = NIF_ICON;
             self.nid.hIcon = new_hicon;
-            unsafe {
-                let _ = Shell_NotifyIconW(NIM_MODIFY, &self.nid);
+            if self.visible {
+                unsafe {
+                    let _ = Shell_NotifyIconW(NIM_MODIFY, &self.nid);
+                }
             }
             if let Some(old) = self.current_hicon.replace(new_hicon) {
                 unsafe {
@@ -310,8 +340,10 @@ impl TrayManager {
         for (i, c) in tip.encode_utf16().take(127).enumerate() {
             self.nid.szTip[i] = c;
         }
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &self.nid);
+        if self.visible {
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &self.nid);
+            }
         }
     }
 }
@@ -319,7 +351,9 @@ impl TrayManager {
 impl Drop for TrayManager {
     fn drop(&mut self) {
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
+            if self.visible {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
+            }
             if let Some(hicon) = self.current_hicon {
                 let _ = DestroyIcon(hicon);
             }
@@ -329,10 +363,16 @@ impl Drop for TrayManager {
 
 pub static GLOBAL_TRAY: Mutex<Option<TrayManager>> = Mutex::new(None);
 
-pub fn init_tray(hwnd: HWND, initial_image: Option<&image::RgbaImage>) {
-    let tray = TrayManager::new(hwnd, initial_image);
+pub fn init_tray(hwnd: HWND, initial_image: Option<&image::RgbaImage>, visible: bool) {
+    let tray = TrayManager::new(hwnd, initial_image, visible);
     let mut guard = GLOBAL_TRAY.lock().unwrap();
     *guard = Some(tray);
+}
+
+pub fn set_tray_visible(show: bool) {
+    if let Some(tray) = GLOBAL_TRAY.lock().ok().as_mut().and_then(|g| g.as_mut()) {
+        tray.set_visible(show);
+    }
 }
 
 pub fn update_tray_icon(image: Option<&image::RgbaImage>) {
@@ -469,7 +509,29 @@ pub fn show_tray_context_menu(
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        // 5. Windows Startup Toggle
+        // 5. Display Mode Submenu
+        let mode_submenu = match CreatePopupMenu() {
+            Ok(msm) => {
+                let tray_flag = if cfg.display_mode == DisplayMode::Tray {
+                    MF_CHECKED | MF_STRING
+                } else {
+                    MF_UNCHECKED | MF_STRING
+                };
+                let taskbar_flag = if cfg.display_mode == DisplayMode::Taskbar {
+                    MF_CHECKED | MF_STRING
+                } else {
+                    MF_UNCHECKED | MF_STRING
+                };
+                let _ = AppendMenuW(msm, tray_flag, IDM_MODE_TRAY, w!("Tray Icon"));
+                let _ = AppendMenuW(msm, taskbar_flag, IDM_MODE_TASKBAR, w!("Taskbar Mini UI"));
+
+                let _ = AppendMenuW(menu, MF_POPUP, msm.0 as usize, w!("Display Mode"));
+                Some(msm)
+            }
+            Err(_) => None,
+        };
+
+        // 6. Windows Startup Toggle
         let startup_enabled = startup::is_startup_enabled();
         let startup_flags = if startup_enabled {
             MF_CHECKED | MF_STRING
@@ -513,6 +575,16 @@ pub fn show_tray_context_menu(
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
 
+        struct MenuOpenGuard;
+        impl Drop for MenuOpenGuard {
+            fn drop(&mut self) {
+                crate::taskbar::set_context_menu_open(false);
+                crate::taskbar::tick_taskbar();
+            }
+        }
+        crate::taskbar::set_context_menu_open(true);
+        let _menu_guard = MenuOpenGuard;
+
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(
             menu,
@@ -526,6 +598,9 @@ pub fn show_tray_context_menu(
 
         if let Some(sm) = settings_submenu {
             let _ = DestroyMenu(sm);
+        }
+        if let Some(msm) = mode_submenu {
+            let _ = DestroyMenu(msm);
         }
         if let Some(lsm) = log_submenu {
             let _ = DestroyMenu(lsm);
@@ -574,6 +649,7 @@ pub fn show_settings_dialog(hwnd: HWND, cfg: &AppConfig, config_path: &Path) {
           - Cooldown: {} seconds\n\
           - Debounce: {} ms\n\n\
         History limit: {} images\n\
+        Display mode:  {}\n\
         Log level:     {}\n\
         Windows Startup: {}\n\n\
         Configuration file: {}\n\n\
@@ -585,6 +661,7 @@ pub fn show_settings_dialog(hwnd: HWND, cfg: &AppConfig, config_path: &Path) {
         cfg.cooldown_seconds,
         cfg.debounce_millis,
         cfg.history_count,
+        cfg.display_mode.label(),
         cfg.log_level,
         startup_state,
         config_path.display()
