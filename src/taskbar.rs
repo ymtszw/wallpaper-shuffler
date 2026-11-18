@@ -1124,10 +1124,7 @@ impl TaskbarWidget {
     }
 
     fn update_popup_visibility(&mut self) {
-        let should_show = self.visible
-            && self.is_alive()
-            && TASKBAR_HOVER.load(Ordering::SeqCst)
-            && !CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
+        let should_show = self.visible && self.is_alive() && TASKBAR_HOVER.load(Ordering::SeqCst);
         if should_show {
             if !self.popup_visible {
                 self.show_popup();
@@ -1237,34 +1234,33 @@ impl TaskbarWidget {
             self.hide_popup();
             return;
         }
-        if CONTEXT_MENU_OPEN.load(Ordering::SeqCst) {
-            self.hide_popup();
-            return;
-        }
         if !self.is_alive() {
             let _ = self.create();
             return;
         }
-        // Safety fallback: verify cursor is still over the widget in case WM_MOUSELEAVE was missed
-        if TASKBAR_HOVER.load(Ordering::SeqCst)
+        let menu_open = CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
+        // Track cursor bounds via GetCursorPos while context menu captures input or as a fallback
+        if (menu_open || TASKBAR_HOVER.load(Ordering::SeqCst))
             && let Some(wnd) = self.hwnd
         {
             unsafe {
                 let mut pt = POINT::default();
                 let mut rect = RECT::default();
-                if GetCursorPos(&mut pt).is_ok()
-                    && GetWindowRect(wnd, &mut rect).is_ok()
-                    && !PtInRect(&rect, pt).as_bool()
-                {
-                    TASKBAR_HOVER.store(false, Ordering::SeqCst);
-                    TASKBAR_NEEDS_REPAINT.store(true, Ordering::SeqCst);
+                if GetCursorPos(&mut pt).is_ok() && GetWindowRect(wnd, &mut rect).is_ok() {
+                    let over = PtInRect(&rect, pt).as_bool();
+                    if TASKBAR_HOVER.load(Ordering::SeqCst) != over {
+                        TASKBAR_HOVER.store(over, Ordering::SeqCst);
+                        TASKBAR_NEEDS_REPAINT.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         }
         if TASKBAR_NEEDS_REPAINT.swap(false, Ordering::SeqCst) {
             self.paint();
         }
-        self.reposition();
+        if !menu_open {
+            self.reposition();
+        }
         self.update_popup_visibility();
     }
 
@@ -1570,12 +1566,6 @@ pub fn set_taskbar_status(status: &str) {
 
 pub fn set_context_menu_open(open: bool) {
     CONTEXT_MENU_OPEN.store(open, Ordering::SeqCst);
-    if open
-        && let Ok(mut guard) = GLOBAL_TASKBAR.try_lock()
-        && let Some(widget) = guard.as_mut()
-    {
-        widget.hide_popup();
-    }
 }
 
 pub fn is_taskbar_active() -> bool {
