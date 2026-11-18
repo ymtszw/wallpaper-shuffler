@@ -7,7 +7,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HGDIOBJ, ReleaseDC, ScreenToClient,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PtInRect, ReleaseDC, ScreenToClient,
     SelectObject,
 };
 use windows::Win32::System::Com::{
@@ -22,28 +23,26 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
     UIA_AutomationIdPropertyId,
 };
-use windows::Win32::UI::Controls::{
-    ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_IDISHWND,
-    TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP,
-    TTS_NOPREFIX, TTTOOLINFOW,
-};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowExW, FindWindowW,
-    GW_HWNDPREV, GWL_EXSTYLE, GetClassNameW, GetClientRect, GetWindow, GetWindowLongW,
-    GetWindowRect, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, IsWindow, IsWindowVisible,
-    LoadCursorW, MA_NOACTIVATE, MoveWindow, PostMessageW, RegisterClassExW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW,
-    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SIZE, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_LAYOUTRTL, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GW_HWNDPREV, GWL_EXSTYLE, GetClassNameW, GetClientRect, GetCursorPos, GetWindow,
+    GetWindowLongW, GetWindowRect, HCURSOR, HICON, HWND_TOPMOST, IDC_ARROW, IsWindow,
+    IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MoveWindow, PostMessageW, RegisterClassExW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_RBUTTONUP, WM_SIZE, WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_LAYOUTRTL,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{BOOL, BSTR, PWSTR, w};
+use windows::core::{BOOL, BSTR, w};
 
+pub const WM_TASKBAR_HOVER_CHANGED: u32 = WM_USER + 102;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const PREVIEW_CACHE_W: u32 = 160;
 const PREVIEW_CACHE_H: u32 = 90;
+const POPUP_LOGICAL_WIDTH: f32 = 600.0;
+const POPUP_MAX_CACHE_W: u32 = 1200;
 
 static TASKBAR_HOVER: AtomicBool = AtomicBool::new(false);
 static TASKBAR_NOTIFY_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -347,6 +346,214 @@ pub fn render_taskbar_thumbnail(
     canvas
 }
 
+fn resize_popup_cache(img: &image::RgbaImage) -> image::RgbaImage {
+    let w = img.width();
+    let h = img.height();
+    if w == 0 || h == 0 || w <= POPUP_MAX_CACHE_W {
+        return img.clone();
+    }
+    let target_h = ((POPUP_MAX_CACHE_W as f32 * h as f32) / w as f32)
+        .round()
+        .max(1.0) as u32;
+    image::imageops::resize(
+        img,
+        POPUP_MAX_CACHE_W,
+        target_h,
+        image::imageops::FilterType::Triangle,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopupLayout {
+    pub total_w: u32,
+    pub total_h: u32,
+    pub img_w: u32,
+    pub img_h: u32,
+    pub pad: u32,
+    pub shadow: u32,
+}
+
+/// Computes the popup card and image dimensions (~600 logical px wide) clamped to monitor work area.
+pub fn compute_popup_dimensions(
+    source_dims: Option<(u32, u32)>,
+    dpi_scale: f32,
+    max_work_w: i32,
+    max_work_h: i32,
+) -> PopupLayout {
+    let pad = (6.0 * dpi_scale).round().max(2.0) as u32;
+    let shadow = (8.0 * dpi_scale).round().max(2.0) as u32;
+    let chrome = (pad + shadow) * 2;
+
+    let max_img_w = (max_work_w.max(200) as u32).saturating_sub(chrome).max(160);
+    let img_w = ((POPUP_LOGICAL_WIDTH * dpi_scale).round() as u32).clamp(160, max_img_w);
+
+    let max_img_h = ((max_work_h.max(240) as f32 * 0.65).round() as u32)
+        .saturating_sub(chrome)
+        .max(120);
+    let raw_img_h = match source_dims {
+        Some((sw, sh)) if sw > 0 && sh > 0 => {
+            ((img_w as f32 * sh as f32) / sw as f32).round().max(90.0) as u32
+        }
+        _ => (img_w * 9 / 16).max(90),
+    };
+    let img_h = raw_img_h.min(max_img_h);
+
+    PopupLayout {
+        total_w: img_w + chrome,
+        total_h: img_h + chrome,
+        img_w,
+        img_h,
+        pad,
+        shadow,
+    }
+}
+
+/// Renders the hover preview popup card (soft shadow, rounded frame, and scaled wallpaper).
+pub fn render_popup_preview(
+    source: Option<&image::RgbaImage>,
+    layout: PopupLayout,
+    dpi_scale: f32,
+    light_theme: bool,
+) -> image::RgbaImage {
+    let mut canvas =
+        image::RgbaImage::from_pixel(layout.total_w, layout.total_h, image::Rgba([0, 0, 0, 0]));
+
+    let shadow_f = layout.shadow as f32;
+    let pad_f = layout.pad as f32;
+    let card_x = shadow_f;
+    let card_y = shadow_f;
+    let card_w = (layout.img_w + layout.pad * 2) as f32;
+    let card_h = (layout.img_h + layout.pad * 2) as f32;
+    let card_r = (10.0 * dpi_scale).min(card_h * 0.25);
+    let border_w = dpi_scale.max(1.0);
+
+    let bg_color = if light_theme {
+        [245, 246, 250, 248]
+    } else {
+        [28, 31, 40, 248]
+    };
+    let border_color = if light_theme {
+        [0, 0, 0, 42]
+    } else {
+        [255, 255, 255, 48]
+    };
+
+    for y in 0..layout.total_h {
+        for x in 0..layout.total_w {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let d = sd_round_rect(px, py, card_x, card_y, card_w, card_h, card_r);
+            if d > 0.0 && d < shadow_f {
+                let t = 1.0 - d / shadow_f;
+                let a = (t * t * 90.0).round().clamp(0.0, 255.0) as u8;
+                if a > 0 {
+                    alpha_blend_pixel(&mut canvas.get_pixel_mut(x, y).0, [0, 0, 0, a]);
+                }
+            } else if d < 0.75 {
+                let cov = (0.75 - d).clamp(0.0, 1.0);
+                let mut bg = bg_color;
+                bg[3] = (bg[3] as f32 * cov).round() as u8;
+                alpha_blend_pixel(&mut canvas.get_pixel_mut(x, y).0, bg);
+
+                let ring_d = d.abs();
+                if ring_d < border_w + 0.5 {
+                    let ring_cov = ((border_w + 0.5 - ring_d) * cov).clamp(0.0, 1.0);
+                    let mut bd = border_color;
+                    bd[3] = (bd[3] as f32 * ring_cov).round() as u8;
+                    alpha_blend_pixel(&mut canvas.get_pixel_mut(x, y).0, bd);
+                }
+            }
+        }
+    }
+
+    let img_x = shadow_f + pad_f;
+    let img_y = shadow_f + pad_f;
+    let img_w_f = layout.img_w as f32;
+    let img_h_f = layout.img_h as f32;
+    let img_r = (6.0 * dpi_scale).min(img_h_f * 0.2);
+
+    let resized_src = source.map(|src| {
+        image::imageops::resize(
+            src,
+            layout.img_w,
+            layout.img_h,
+            image::imageops::FilterType::Triangle,
+        )
+    });
+
+    let x0 = (layout.shadow + layout.pad).min(layout.total_w);
+    let y0 = (layout.shadow + layout.pad).min(layout.total_h);
+    let x1 = (x0 + layout.img_w).min(layout.total_w);
+    let y1 = (y0 + layout.img_h).min(layout.total_h);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let d = sd_round_rect(px, py, img_x, img_y, img_w_f, img_h_f, img_r);
+            if d < 0.75 {
+                let cov = (0.75 - d).clamp(0.0, 1.0);
+                let mut px_color = if let Some(ref img) = resized_src {
+                    let sx = (x - x0).min(layout.img_w - 1);
+                    let sy = (y - y0).min(layout.img_h - 1);
+                    img.get_pixel(sx, sy).0
+                } else {
+                    let nx = (x - x0) as f32 / img_w_f;
+                    let ny = (y - y0) as f32 / img_h_f;
+                    sample_default_landscape(nx, ny)
+                };
+                px_color[3] = (px_color[3] as f32 * cov).round() as u8;
+                alpha_blend_pixel(&mut canvas.get_pixel_mut(x, y).0, px_color);
+            }
+        }
+    }
+
+    canvas
+}
+
+/// Computes the screen-space `(left, top)` for the hover popup above (or below) the taskbar.
+pub fn compute_popup_position(
+    widget_rect: RECT,
+    taskbar_rect: RECT,
+    monitor_rect: RECT,
+    popup_w: i32,
+    popup_h: i32,
+    shadow: i32,
+    dpi_scale: f32,
+) -> (i32, i32) {
+    let margin = (8.0 * dpi_scale).round() as i32;
+    let gap = (8.0 * dpi_scale).round() as i32 - shadow;
+
+    let ideal_x = (widget_rect.left + widget_rect.right) / 2 - popup_w / 2;
+    let min_x = monitor_rect.left + margin - shadow;
+    let max_x = (monitor_rect.right - margin + shadow - popup_w).max(min_x);
+    let x = ideal_x.clamp(min_x, max_x);
+
+    let taskbar_at_top = taskbar_rect.top <= monitor_rect.top + 10;
+    let raw_y = if taskbar_at_top {
+        taskbar_rect.bottom + gap
+    } else {
+        taskbar_rect.top - popup_h - gap
+    };
+    let min_y = monitor_rect.top;
+    let max_y = (monitor_rect.bottom - popup_h).max(min_y);
+    let y = raw_y.clamp(min_y, max_y);
+
+    (x, y)
+}
+
+unsafe extern "system" fn popup_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
 fn push_rgba_to_layered_window(hwnd: HWND, img: &image::RgbaImage, alpha: u8) {
     let w = img.width() as i32;
     let h = img.height() as i32;
@@ -423,6 +630,21 @@ fn push_rgba_to_layered_window(hwnd: HWND, img: &image::RgbaImage, alpha: u8) {
     }
 }
 
+fn notify_hover_changed() {
+    let notify_raw = TASKBAR_NOTIFY_HWND.load(Ordering::SeqCst);
+    if notify_raw != 0 {
+        let notify_hwnd = HWND(notify_raw as *mut std::ffi::c_void);
+        unsafe {
+            let _ = PostMessageW(
+                Some(notify_hwnd),
+                WM_TASKBAR_HOVER_CHANGED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 unsafe extern "system" fn taskbar_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -442,12 +664,14 @@ unsafe extern "system" fn taskbar_wnd_proc(
                     let _ = TrackMouseEvent(&mut tme);
                 }
                 TASKBAR_NEEDS_REPAINT.store(true, Ordering::SeqCst);
+                notify_hover_changed();
             }
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
             TASKBAR_HOVER.store(false, Ordering::SeqCst);
             TASKBAR_NEEDS_REPAINT.store(true, Ordering::SeqCst);
+            notify_hover_changed();
             LRESULT(0)
         }
         WM_LBUTTONUP | WM_RBUTTONUP => {
@@ -472,11 +696,14 @@ unsafe extern "system" fn taskbar_wnd_proc(
 
 pub struct TaskbarWidget {
     hwnd: Option<HWND>,
+    popup_hwnd: Option<HWND>,
     taskbar_hwnd: Option<HWND>,
     rebar_hwnd: Option<HWND>,
-    tip_hwnd: Option<HWND>,
     notify_hwnd: HWND,
     preview_image: Option<image::RgbaImage>,
+    popup_image: Option<image::RgbaImage>,
+    cached_popup_render: Option<(u32, bool, PopupLayout, image::RgbaImage)>,
+    popup_visible: bool,
     is_paused: bool,
     status_text: String,
     visible: bool,
@@ -489,7 +716,6 @@ pub struct TaskbarWidget {
     last_left: i32,
     width: i32,
     height: i32,
-    last_tip_text: String,
     uia: Option<IUIAutomation>,
     widgets_btn: Option<IUIAutomationElement>,
     last_uia_check: Option<Instant>,
@@ -623,13 +849,17 @@ impl TaskbarWidget {
                 image::imageops::FilterType::Triangle,
             )
         });
+        let popup_cached = initial_image.map(resize_popup_cache);
         Self {
             hwnd: None,
+            popup_hwnd: None,
             taskbar_hwnd: None,
             rebar_hwnd: None,
-            tip_hwnd: None,
             notify_hwnd,
             preview_image: cached,
+            popup_image: popup_cached,
+            cached_popup_render: None,
+            popup_visible: false,
             is_paused: false,
             status_text: "Ready".to_string(),
             visible: false,
@@ -642,7 +872,6 @@ impl TaskbarWidget {
             last_left: -1,
             width: 0,
             height: 0,
-            last_tip_text: String::new(),
             uia: None,
             widgets_btn: None,
             last_uia_check: None,
@@ -718,7 +947,16 @@ impl TaskbarWidget {
                         hIcon: HICON::default(),
                         ..Default::default()
                     };
-                    if RegisterClassExW(&wc) != 0 {
+                    let popup_wc = WNDCLASSEXW {
+                        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                        lpfnWndProc: Some(popup_wnd_proc),
+                        hInstance: hinst.into(),
+                        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or(HCURSOR::default()),
+                        lpszClassName: w!("WallpaperShufflerTaskbarPreview"),
+                        hIcon: HICON::default(),
+                        ..Default::default()
+                    };
+                    if RegisterClassExW(&wc) != 0 && RegisterClassExW(&popup_wc) != 0 {
                         *reg = true;
                     }
                 }
@@ -746,53 +984,156 @@ impl TaskbarWidget {
             self.visible = true;
             TASKBAR_ACTIVE.store(true, Ordering::Relaxed);
 
-            let icc = INITCOMMONCONTROLSEX {
-                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-                dwICC: ICC_WIN95_CLASSES,
-            };
-            let _ = InitCommonControlsEx(&icc);
-
-            if let Ok(tip) = CreateWindowExW(
-                WS_EX_TOPMOST,
-                TOOLTIPS_CLASSW,
-                None,
-                WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
-                0,
-                0,
-                0,
-                0,
-                Some(self.notify_hwnd),
-                Some(HMENU::default()),
-                Some(hinst.into()),
-                None,
-            ) {
-                let mut title: Vec<u16> =
-                    "Wallpaper Shuffler".encode_utf16().chain(Some(0)).collect();
-                let ti = TTTOOLINFOW {
-                    cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
-                    uFlags: TTF_IDISHWND | TTF_SUBCLASS,
-                    hwnd: self.notify_hwnd,
-                    uId: wnd.0 as usize,
-                    lpszText: PWSTR(title.as_mut_ptr()),
-                    ..Default::default()
-                };
-                SendMessageW(
-                    tip,
-                    TTM_ADDTOOLW,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(&ti as *const _ as isize)),
-                );
-                SendMessageW(tip, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(400)));
-                self.tip_hwnd = Some(tip);
-            }
-
             self.last_dpi = self.current_dpi();
             self.paint();
-            self.update_tooltip();
             self.last_w = -1;
             self.reposition();
             let _ = ShowWindow(wnd, SW_SHOWNOACTIVATE);
             true
+        }
+    }
+
+    fn ensure_popup_window(&mut self) -> Option<HWND> {
+        unsafe {
+            if let Some(pwnd) = self.popup_hwnd
+                && IsWindow(Some(pwnd)).as_bool()
+            {
+                return Some(pwnd);
+            }
+            let Ok(hinst) = GetModuleHandleW(None) else {
+                return None;
+            };
+            let Ok(pwnd) = CreateWindowExW(
+                WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST
+                    | WS_EX_LAYERED
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TRANSPARENT,
+                w!("WallpaperShufflerTaskbarPreview"),
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            ) else {
+                return None;
+            };
+            self.popup_hwnd = Some(pwnd);
+            Some(pwnd)
+        }
+    }
+
+    fn show_popup(&mut self) {
+        let (Some(wnd), Some(tb)) = (self.hwnd, self.taskbar_hwnd) else {
+            return;
+        };
+        let Some(pwnd) = self.ensure_popup_window() else {
+            return;
+        };
+
+        unsafe {
+            let mut widget_rect = RECT::default();
+            let mut tb_rect = RECT::default();
+            if GetWindowRect(wnd, &mut widget_rect).is_err()
+                || GetWindowRect(tb, &mut tb_rect).is_err()
+            {
+                return;
+            }
+
+            let hmon = MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let mon_rect = if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                mi.rcMonitor
+            } else {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                }
+            };
+
+            let dpi = self.current_dpi();
+            let dpi_scale = dpi as f32 / 96.0;
+            let light = is_light_taskbar_theme();
+
+            let need_render = !matches!(
+                self.cached_popup_render,
+                Some((cached_dpi, cached_light, _, _)) if cached_dpi == dpi && cached_light == light
+            );
+            if need_render {
+                let src_dims = self.popup_image.as_ref().map(|i| (i.width(), i.height()));
+                let layout = compute_popup_dimensions(
+                    src_dims,
+                    dpi_scale,
+                    mon_rect.right - mon_rect.left,
+                    mon_rect.bottom - mon_rect.top,
+                );
+                let rendered =
+                    render_popup_preview(self.popup_image.as_ref(), layout, dpi_scale, light);
+                push_rgba_to_layered_window(pwnd, &rendered, 255);
+                self.cached_popup_render = Some((dpi, light, layout, rendered));
+            } else if !self.popup_visible
+                && let Some((_, _, _, ref rendered)) = self.cached_popup_render
+            {
+                push_rgba_to_layered_window(pwnd, rendered, 255);
+            }
+
+            let Some((_, _, layout, _)) = self.cached_popup_render else {
+                return;
+            };
+            let (x, y) = compute_popup_position(
+                widget_rect,
+                tb_rect,
+                mon_rect,
+                layout.total_w as i32,
+                layout.total_h as i32,
+                layout.shadow as i32,
+                dpi_scale,
+            );
+            let _ = SetWindowPos(
+                pwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                layout.total_w as i32,
+                layout.total_h as i32,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            self.popup_visible = true;
+        }
+    }
+
+    fn hide_popup(&mut self) {
+        if let Some(pwnd) = self.popup_hwnd
+            && self.popup_visible
+        {
+            unsafe {
+                let _ = ShowWindow(pwnd, SW_HIDE);
+            }
+        }
+        self.popup_visible = false;
+    }
+
+    fn update_popup_visibility(&mut self) {
+        let should_show = self.visible
+            && self.is_alive()
+            && TASKBAR_HOVER.load(Ordering::SeqCst)
+            && !CONTEXT_MENU_OPEN.load(Ordering::SeqCst);
+        if should_show {
+            if !self.popup_visible {
+                self.show_popup();
+            }
+        } else {
+            self.hide_popup();
         }
     }
 
@@ -813,9 +1154,10 @@ impl TaskbarWidget {
             }
             self.rebar_hwnd = None;
             self.widgets_btn = None;
-            if let Some(tip) = self.tip_hwnd.take() {
-                let _ = DestroyWindow(tip);
+            if let Some(pwnd) = self.popup_hwnd.take() {
+                let _ = DestroyWindow(pwnd);
             }
+            self.popup_visible = false;
             if let Some(wnd) = self.hwnd.take() {
                 let _ = DestroyWindow(wnd);
             }
@@ -844,6 +1186,7 @@ impl TaskbarWidget {
             }
             true
         } else {
+            self.hide_popup();
             if let Some(wnd) = self.hwnd {
                 unsafe {
                     let _ = ShowWindow(wnd, SW_HIDE);
@@ -864,9 +1207,14 @@ impl TaskbarWidget {
                 image::imageops::FilterType::Triangle,
             )
         });
+        self.popup_image = image.map(resize_popup_cache);
+        self.cached_popup_render = None;
         if self.is_alive() && self.visible {
             self.paint();
             self.reposition();
+            if self.popup_visible {
+                self.show_popup();
+            }
         }
     }
 
@@ -875,7 +1223,6 @@ impl TaskbarWidget {
             return;
         }
         self.is_paused = paused;
-        self.update_tooltip();
         if self.is_alive() && self.visible {
             self.paint();
         }
@@ -883,24 +1230,42 @@ impl TaskbarWidget {
 
     pub fn set_status_text(&mut self, status: &str) {
         self.status_text = status.to_string();
-        self.update_tooltip();
     }
 
     pub fn tick(&mut self) {
         if !self.visible {
+            self.hide_popup();
             return;
         }
         if CONTEXT_MENU_OPEN.load(Ordering::SeqCst) {
+            self.hide_popup();
             return;
         }
         if !self.is_alive() {
             let _ = self.create();
             return;
         }
+        // Safety fallback: verify cursor is still over the widget in case WM_MOUSELEAVE was missed
+        if TASKBAR_HOVER.load(Ordering::SeqCst)
+            && let Some(wnd) = self.hwnd
+        {
+            unsafe {
+                let mut pt = POINT::default();
+                let mut rect = RECT::default();
+                if GetCursorPos(&mut pt).is_ok()
+                    && GetWindowRect(wnd, &mut rect).is_ok()
+                    && !PtInRect(&rect, pt).as_bool()
+                {
+                    TASKBAR_HOVER.store(false, Ordering::SeqCst);
+                    TASKBAR_NEEDS_REPAINT.store(true, Ordering::SeqCst);
+                }
+            }
+        }
         if TASKBAR_NEEDS_REPAINT.swap(false, Ordering::SeqCst) {
             self.paint();
         }
         self.reposition();
+        self.update_popup_visibility();
     }
 
     /// Lightweight Z-order-only check & restore (no UIA, no EnumWindows, no repaint).
@@ -946,41 +1311,6 @@ impl TaskbarWidget {
                 .map(|tb| GetDpiForWindow(tb))
                 .filter(|&d| d > 0)
                 .unwrap_or(96)
-        }
-    }
-
-    fn update_tooltip(&mut self) {
-        let Some(tip) = self.tip_hwnd else {
-            return;
-        };
-        let Some(wnd) = self.hwnd else {
-            return;
-        };
-        let state = if self.is_paused {
-            "Paused"
-        } else {
-            self.status_text.as_str()
-        };
-        let text = format!("Wallpaper Shuffler ({})\nClick: Open Menu", state);
-        if text == self.last_tip_text {
-            return;
-        }
-        self.last_tip_text = text.clone();
-        let mut wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        let ti = TTTOOLINFOW {
-            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
-            hwnd: self.notify_hwnd,
-            uId: wnd.0 as usize,
-            lpszText: PWSTR(wide.as_mut_ptr()),
-            ..Default::default()
-        };
-        unsafe {
-            SendMessageW(
-                tip,
-                TTM_UPDATETIPTEXTW,
-                Some(WPARAM(0)),
-                Some(LPARAM(&ti as *const _ as isize)),
-            );
         }
     }
 
@@ -1240,6 +1570,12 @@ pub fn set_taskbar_status(status: &str) {
 
 pub fn set_context_menu_open(open: bool) {
     CONTEXT_MENU_OPEN.store(open, Ordering::SeqCst);
+    if open
+        && let Ok(mut guard) = GLOBAL_TASKBAR.try_lock()
+        && let Some(widget) = guard.as_mut()
+    {
+        widget.hide_popup();
+    }
 }
 
 pub fn is_taskbar_active() -> bool {
@@ -1327,5 +1663,63 @@ mod tests {
         }];
         let rtl_left = resolve_non_overlapping_left(98, 72, 2, true, &rtl_obs);
         assert_eq!(rtl_left, 252);
+    }
+
+    #[test]
+    fn test_compute_popup_dimensions_scales_and_clamps() {
+        let layout_100 = compute_popup_dimensions(Some((3840, 2160)), 1.0, 1920, 1080);
+        assert_eq!(layout_100.img_w, 600);
+        assert_eq!(layout_100.img_h, 338);
+        assert_eq!(
+            layout_100.total_w,
+            layout_100.img_w + (layout_100.pad + layout_100.shadow) * 2
+        );
+
+        let layout_150 = compute_popup_dimensions(Some((3840, 2160)), 1.5, 3840, 2160);
+        assert_eq!(layout_150.img_w, 900);
+        assert_eq!(layout_150.img_h, 506);
+    }
+
+    #[test]
+    fn test_render_popup_preview_dimensions_and_pixels() {
+        let layout = compute_popup_dimensions(Some((1920, 1080)), 1.0, 1920, 1080);
+        let src = image::RgbaImage::from_pixel(1920, 1080, image::Rgba([30, 140, 220, 255]));
+        let rendered = render_popup_preview(Some(&src), layout, 1.0, false);
+        assert_eq!(rendered.dimensions(), (layout.total_w, layout.total_h));
+        // Outer corner is transparent
+        assert_eq!(rendered.get_pixel(0, 0)[3], 0);
+        // Center pixel matches source color
+        let center = rendered.get_pixel(layout.total_w / 2, layout.total_h / 2);
+        assert_eq!(center[3], 255);
+        assert_eq!(center[0], 30);
+        assert_eq!(center[1], 140);
+        assert_eq!(center[2], 220);
+    }
+
+    #[test]
+    fn test_compute_popup_position_clamps_to_monitor() {
+        let widget = RECT {
+            left: 1750,
+            top: 1032,
+            right: 1820,
+            bottom: 1080,
+        };
+        let taskbar = RECT {
+            left: 0,
+            top: 1032,
+            right: 1920,
+            bottom: 1080,
+        };
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let (x, y) = compute_popup_position(widget, taskbar, monitor, 628, 366, 8, 1.0);
+        // Clamped so right edge stays inside monitor (1920 - 8 + 8 - 628 = 1292)
+        assert_eq!(x, 1292);
+        // Placed above bottom taskbar: 1032 - 366 - (8 - 8) = 666
+        assert_eq!(y, 666);
     }
 }

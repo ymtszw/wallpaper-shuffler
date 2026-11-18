@@ -283,6 +283,10 @@ unsafe extern "system" fn window_proc(
                 tray::show_tray_context_menu(hwnd, &cfg, is_paused, log_level);
             }
         }
+        taskbar::WM_TASKBAR_HOVER_CHANGED => {
+            taskbar::tick_taskbar();
+            return LRESULT(0);
+        }
         WM_COMMAND => match wparam.0 {
             tray::IDM_SHUFFLE_NOW => {
                 trigger_manual_shuffle();
